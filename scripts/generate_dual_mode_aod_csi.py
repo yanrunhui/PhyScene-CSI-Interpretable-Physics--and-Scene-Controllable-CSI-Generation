@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from physics_csi.generation_mode import CandidateBudgetPolicy, resolve_generation_route
 from physics_csi.models.diffusion.multipath_diffusion import MultipathDiffusionModel
 from physics_csi.models.scene_delay_power_residual import SceneConditionedDelayPowerResidual
 from physics_csi.models.scene_link_global_aod_residual import (
@@ -22,9 +23,8 @@ from physics_csi.models.scene_link_global_aod_residual import (
 )
 from physics_csi.physics.aod_control import (
     AoDControlProjector,
-    select_aod_candidates_within_tolerance,
-    select_nearest_aod_candidates,
     select_payload_samples,
+    select_random_aod_candidates_within_tolerance,
 )
 from physics_csi.physics.constraints import check_condition_feasibility
 from physics_csi.physics.synthesizer import MIMOOFDMSynthesizer, SystemConfig
@@ -150,6 +150,50 @@ def _load_models(
     return b3, dp, link, b3_checkpoint
 
 
+def _load_dp_model(
+    checkpoint_path: Path, device: torch.device
+) -> tuple[SceneConditionedDelayPowerResidual, Mapping[str, Any]]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if checkpoint.get("model_kind") != "scene_delay_power_residual":
+        raise ValueError("--dp-checkpoint is not a DP residual")
+    model = SceneConditionedDelayPowerResidual(**checkpoint["model_init"]).to(device)
+    model.load_state_dict(
+        checkpoint.get("ema_state_dict", checkpoint["model_state_dict"])
+    )
+    return model.requires_grad_(False).eval(), checkpoint
+
+
+def _load_aod_conditioned_model(
+    checkpoint_path: Path,
+    dp: SceneConditionedDelayPowerResidual,
+    device: torch.device,
+) -> tuple[MultipathDiffusionModel, Mapping[str, Any], int]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if checkpoint.get("model_kind") != "multipath_diffusion_scene_id_aod_conditioned":
+        raise ValueError("--aod-checkpoint is not an AoD-conditioned B3 checkpoint")
+    config = checkpoint["config"]
+    if not config["multipath_diffusion"].get("aod_conditioning", {}).get(
+        "enabled", False
+    ):
+        raise ValueError("--aod-checkpoint does not enable Mean-AoD conditioning")
+    trained_path_count = config.get("aod_conditioned_data", {}).get("path_count")
+    if trained_path_count is None:
+        raise ValueError("AoD checkpoint does not record its trained path count")
+    system = SystemConfig.from_mapping(config["data"]["system"])
+    model = MultipathDiffusionModel(
+        config["multipath_diffusion"], system, checkpoint["statistics"]
+    ).to(device)
+    model.load_state_dict(
+        checkpoint.get("ema_state_dict", checkpoint["model_state_dict"])
+    )
+    model.requires_grad_(False).eval()
+    if model.map_id_to_index != dp.map_id_to_index:
+        raise ValueError("AoD-conditioned B3 and DP residual use different Map mappings")
+    if model.max_paths != dp.max_paths:
+        raise ValueError("AoD-conditioned B3 and DP residual use different max_paths")
+    return model, checkpoint, int(trained_path_count)
+
+
 def _support_audit(
     cache_path: str | None,
     *,
@@ -205,58 +249,61 @@ def _support_audit(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate CSI with B3 + DP + Link-global and optional dual-mode AoD control."
+        description=(
+            "Generate CSI through one of two frozen routes: B3+DP+Link-global "
+            "without a Mean-AoD request, or AoD-B3(CFG=2)+DP with bounded "
+            "natural-angle candidate filtering when Mean AoD is set."
+        )
     )
-    parser.add_argument("--b3-checkpoint", required=True)
+    parser.add_argument("--b3-checkpoint")
+    parser.add_argument("--aod-checkpoint")
     parser.add_argument("--dp-checkpoint", required=True)
-    parser.add_argument("--link-checkpoint", required=True)
+    parser.add_argument("--link-checkpoint")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--report", default=None)
-    parser.add_argument("--support-cache", default=None)
+    parser.add_argument("--report")
+    parser.add_argument("--support-cache")
     parser.add_argument("--map-id", type=_map_id, required=True)
-    parser.add_argument("--num-samples", type=int, default=1000)
+    parser.add_argument("--num-samples", type=int, default=8)
     parser.add_argument("--total-power-db", type=float, required=True)
     parser.add_argument("--delay-spread-ns", type=float, required=True)
     parser.add_argument("--k-factor-db", type=float, default=0.0)
     parser.add_argument("--los-status", type=int, choices=[0, 1], required=True)
     parser.add_argument("--path-count", type=int, required=True)
-    parser.add_argument("--target-aod-az-deg", type=float, default=None)
     parser.add_argument(
-        "--aod-control-mode",
-        choices=["none", "mean", "strongest"],
-        default="mean",
+        "--target-aod-az-deg",
+        type=float,
         help=(
-            "Reference used by the optional target angle. 'none' explicitly disables "
-            "the projector and cannot be combined with --target-aod-az-deg."
+            "Power-weighted Mean AoD target. Omitting it selects five-condition mode; "
+            "supplying it selects the AoD-conditioned six-condition route."
         ),
     )
-    parser.add_argument("--minimum-mean-concentration", type=float, default=0.10)
-    parser.add_argument("--strongest-near-tie-margin", type=float, default=0.02)
+    parser.add_argument("--aod-guidance-scale", type=float, default=2.0)
     parser.add_argument(
-        "--selection-strategy",
-        choices=["direct", "resample_project"],
-        default=None,
-        help=argparse.SUPPRESS,
+        "--disable-aod-filter",
+        action="store_true",
+        help="Return direct AoD-B3 samples without the default natural ±tolerance filter.",
     )
-    parser.add_argument(
-        "--control-policy",
-        choices=["direct", "realism_first", "exact_control"],
-        default=None,
-        help=(
-            "realism_first accepts natural links inside a fixed tolerance without "
-            "rotation; exact_control requires the selected residual rotation to stay "
-            "inside its safety threshold. When omitted, a supplied target uses "
-            "realism_first and generation without a target remains uncontrolled."
-        ),
-    )
-    parser.add_argument("--candidate-multiplier", type=int, default=20)
-    parser.add_argument("--candidate-generation-batch-size", type=int, default=512)
     parser.add_argument("--natural-angle-tolerance-deg", type=float, default=10.0)
-    parser.add_argument("--maximum-small-projection-deg", type=float, default=10.0)
+    parser.add_argument("--minimum-mean-concentration", type=float, default=0.10)
+    parser.add_argument("--candidate-multiplier", type=int, default=2)
     parser.add_argument(
-        "--require-small-projection", action="store_true", help=argparse.SUPPRESS
+        "--candidate-top-up-size",
+        type=int,
+        default=8,
+        help="Additional candidates generated per retry when fewer than requested pass.",
     )
-    parser.add_argument("--exclude-strongest-near-ties", action="store_true")
+    parser.add_argument(
+        "--maximum-candidate-multiplier",
+        type=int,
+        default=8,
+        help="Hard candidate budget relative to the requested output count.",
+    )
+    parser.add_argument("--candidate-generation-batch-size", type=int, default=512)
+    parser.add_argument(
+        "--selection-seed",
+        type=int,
+        help="Independent seed for uniform sampling from all eligible candidates.",
+    )
     parser.add_argument(
         "--k-factor-validity",
         choices=["auto", "valid", "invalid"],
@@ -264,34 +311,72 @@ def main() -> None:
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=2026)
-    parser.add_argument("--sampler", choices=["ddpm", "ddim"], default=None)
-    parser.add_argument("--sampling-steps", type=int, default=None)
-    parser.add_argument("--guidance-scale", type=float, default=None)
+    parser.add_argument("--sampler", choices=["ddpm", "ddim"])
+    parser.add_argument("--sampling-steps", type=int)
+    parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        help="Optional guidance override for five-condition B3 only.",
+    )
     args = parser.parse_args()
-    if args.control_policy is not None:
-        control_policy = args.control_policy
-    elif args.selection_strategy == "resample_project":
-        control_policy = "exact_control"
-    elif args.selection_strategy == "direct":
-        control_policy = "direct"
-    elif args.target_aod_az_deg is not None:
-        control_policy = "realism_first"
-    else:
-        control_policy = "direct"
+
     if args.num_samples < 1:
         parser.error("num-samples must be positive")
-    if args.aod_control_mode == "none" and args.target_aod_az_deg is not None:
-        parser.error("--aod-control-mode none cannot be combined with a target angle")
-    if control_policy in {"realism_first", "exact_control"} and args.target_aod_az_deg is None:
-        parser.error(f"{control_policy} requires --target-aod-az-deg")
     if args.candidate_multiplier < 1:
         parser.error("candidate-multiplier must be positive")
+    if args.candidate_top_up_size < 1:
+        parser.error("candidate-top-up-size must be positive")
+    if args.maximum_candidate_multiplier < args.candidate_multiplier:
+        parser.error(
+            "maximum-candidate-multiplier cannot be smaller than candidate-multiplier"
+        )
     if args.candidate_generation_batch_size < 1:
         parser.error("candidate-generation-batch-size must be positive")
-    if not 0.0 < args.maximum_small_projection_deg <= 180.0:
-        parser.error("maximum-small-projection-deg must lie in (0, 180]")
     if not 0.0 <= args.natural_angle_tolerance_deg <= 180.0:
         parser.error("natural-angle-tolerance-deg must lie in [0, 180]")
+
+    device = resolve_device(args.device)
+    dp, _ = _load_dp_model(Path(args.dp_checkpoint), device)
+    aod_model: MultipathDiffusionModel | None = None
+    natural_b3: MultipathDiffusionModel | None = None
+    link: SceneConditionedLinkGlobalAoDResidual | None = None
+    checkpoint: Mapping[str, Any]
+    trained_aod_path_count = 5
+
+    if args.target_aod_az_deg is None:
+        if not args.b3_checkpoint or not args.link_checkpoint:
+            parser.error(
+                "five-condition mode requires --b3-checkpoint and --link-checkpoint"
+            )
+        natural_b3, dp, link, checkpoint = _load_models(
+            Path(args.b3_checkpoint),
+            Path(args.dp_checkpoint),
+            Path(args.link_checkpoint),
+            device,
+        )
+    else:
+        if not args.aod_checkpoint:
+            parser.error("six-condition Mean-AoD mode requires --aod-checkpoint")
+        aod_model, checkpoint, trained_aod_path_count = _load_aod_conditioned_model(
+            Path(args.aod_checkpoint), dp, device
+        )
+
+    try:
+        route = resolve_generation_route(
+            target_mean_aod_az_deg=args.target_aod_az_deg,
+            path_count=args.path_count,
+            aod_trained_path_count=trained_aod_path_count,
+            aod_guidance_scale=args.aod_guidance_scale,
+        )
+    except ValueError as error:
+        parser.error(str(error))
+
+    active_model = natural_b3 if route.use_natural_b3 else aod_model
+    if active_model is None:
+        raise RuntimeError("generation route did not load its required backbone")
+    if not 1 <= args.path_count <= active_model.max_paths:
+        parser.error(f"path-count must lie in [1, {active_model.max_paths}]")
+
     k_valid = (
         bool(args.los_status and args.path_count >= 2)
         if args.k_factor_validity == "auto"
@@ -307,306 +392,358 @@ def main() -> None:
         condition_dict, path_count=args.path_count, k_factor_valid=k_valid
     )
 
-    device = resolve_device(args.device)
-    b3, dp, link, b3_checkpoint = _load_models(
-        Path(args.b3_checkpoint),
-        Path(args.dp_checkpoint),
-        Path(args.link_checkpoint),
-        device,
+    apply_filter = route.use_aod_conditioned_b3 and not args.disable_aod_filter
+    candidate_policy = CandidateBudgetPolicy(
+        requested_outputs=args.num_samples,
+        initial_multiplier=args.candidate_multiplier,
+        top_up_candidates=args.candidate_top_up_size,
+        maximum_multiplier=args.maximum_candidate_multiplier,
     )
-    if not 1 <= args.path_count <= b3.max_paths:
-        parser.error(f"path-count must lie in [1, {b3.max_paths}]")
-    candidate_samples = args.num_samples * (
-        args.candidate_multiplier
-        if control_policy in {"realism_first", "exact_control"}
-        else 1
+    maximum_candidate_samples = (
+        candidate_policy.maximum_candidates if apply_filter else args.num_samples
     )
     condition_row = torch.tensor(
         [args.total_power_db, args.delay_spread_ns, args.k_factor_db, args.los_status],
         dtype=torch.float32,
     )
-    sampling = b3_checkpoint["config"]["sampling"]
+    sampling = checkpoint["config"]["sampling"]
     generator = torch.Generator(device=device).manual_seed(args.seed)
-    started = time.perf_counter()
     base_chunks: dict[str, list[torch.Tensor]] = {}
     dp_chunks: dict[str, list[torch.Tensor]] = {}
-    natural_chunks: dict[str, list[torch.Tensor]] = {}
+    final_chunks: dict[str, list[torch.Tensor]] = {}
+    candidate_samples = 0
+    eligible_candidate_samples = 0
+    generation_round_sizes: list[int] = []
+    projector = AoDControlProjector(
+        minimum_mean_concentration=args.minimum_mean_concentration
+    )
+    started = time.perf_counter()
+
     with torch.inference_mode():
-        for start in range(0, candidate_samples, args.candidate_generation_batch_size):
-            batch_samples = min(
-                args.candidate_generation_batch_size, candidate_samples - start
+        while candidate_samples < maximum_candidate_samples:
+            if apply_filter and eligible_candidate_samples >= args.num_samples:
+                break
+            round_size = (
+                candidate_policy.next_round_size(candidate_samples)
+                if apply_filter
+                else args.num_samples
             )
-            conditions_batch = condition_row.to(device).expand(batch_samples, -1)
-            validity_batch = torch.ones_like(conditions_batch, dtype=torch.bool)
-            validity_batch[:, 2] = k_valid
-            external_map = torch.full(
-                (batch_samples,), args.map_id, device=device, dtype=torch.long
+            if round_size == 0:
+                break
+            generation_round_sizes.append(round_size)
+            round_complete = 0
+            while round_complete < round_size:
+                batch_size = min(
+                    args.candidate_generation_batch_size,
+                    round_size - round_complete,
+                )
+                conditions = condition_row.to(device).expand(batch_size, -1)
+                validity = torch.ones_like(conditions, dtype=torch.bool)
+                validity[:, 2] = k_valid
+                map_ids = torch.full(
+                    (batch_size,), args.map_id, device=device, dtype=torch.long
+                )
+                map_index = dp.map_indices(map_ids)
+
+                if route.use_natural_b3:
+                    assert natural_b3 is not None and link is not None
+                    if not torch.equal(map_index, link.map_indices(map_ids)):
+                        raise RuntimeError(
+                            "DP and Link-global resolved the Map ID differently"
+                        )
+                    base_batch = natural_b3.generate(
+                        conditions,
+                        batch_size,
+                        condition_validity=validity,
+                        sampler=args.sampler or str(sampling["sampler"]),
+                        sampling_steps=args.sampling_steps
+                        or int(sampling["sampling_steps"]),
+                        eta=float(sampling.get("eta", 0.0)),
+                        guidance_scale=(
+                            args.guidance_scale
+                            if args.guidance_scale is not None
+                            else float(sampling["guidance_scale"])
+                        ),
+                        forced_path_count=args.path_count,
+                        generator=generator,
+                    )
+                else:
+                    assert (
+                        aod_model is not None
+                        and route.target_mean_aod_az_deg is not None
+                    )
+                    base_batch = aod_model.generate(
+                        conditions,
+                        batch_size,
+                        condition_validity=validity,
+                        sampler=args.sampler or str(sampling["sampler"]),
+                        sampling_steps=args.sampling_steps
+                        or int(sampling["sampling_steps"]),
+                        eta=float(sampling.get("eta", 0.0)),
+                        guidance_scale=float(route.guidance_scale),
+                        forced_path_count=args.path_count,
+                        mean_aod_az_deg=route.target_mean_aod_az_deg,
+                        map_id=map_ids,
+                        generator=generator,
+                    )
+
+                dp_output = dp(base_batch, conditions, validity, map_index=map_index)
+                dp_batch = dp.apply_to_payload(base_batch, dp_output)
+                if route.use_link_global_aod:
+                    assert link is not None
+                    link_output = link(
+                        dp_batch, conditions, validity, map_index=map_index
+                    )
+                    final_batch = link.apply_to_payload(dp_batch, link_output)
+                else:
+                    final_batch = dp_batch
+
+                if apply_filter:
+                    assert route.target_mean_aod_az_deg is not None
+                    measurement = projector(
+                        final_batch,
+                        route.target_mean_aod_az_deg,
+                        mode="mean",
+                    )
+                    eligible_candidate_samples += int(
+                        (
+                            measurement.control_valid
+                            & (
+                                measurement.rotation_deg.abs()
+                                <= args.natural_angle_tolerance_deg
+                            )
+                        ).sum()
+                    )
+
+                _append_payload(base_chunks, base_batch)
+                _append_payload(dp_chunks, dp_batch)
+                _append_payload(final_chunks, final_batch)
+                round_complete += batch_size
+                candidate_samples += batch_size
+                print(
+                    json.dumps(
+                        {
+                            "event": "dual_route_generation_progress",
+                            "generation_mode": route.mode.value,
+                            "generated_candidates": candidate_samples,
+                            "eligible_candidates": eligible_candidate_samples,
+                            "requested_outputs": args.num_samples,
+                            "maximum_candidate_budget": maximum_candidate_samples,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            if not apply_filter:
+                break
+
+        if apply_filter and eligible_candidate_samples < args.num_samples:
+            report_path = (
+                Path(args.report)
+                if args.report
+                else Path(args.output).with_suffix(".json")
             )
-            map_index = link.map_indices(external_map)
-            if not torch.equal(map_index, dp.map_indices(external_map)):
-                raise RuntimeError("DP and Link-global resolved the Map ID differently")
-            base_batch = b3.generate(
-                conditions_batch,
-                batch_samples,
-                condition_validity=validity_batch,
-                sampler=args.sampler or sampling["sampler"],
-                sampling_steps=(
-                    args.sampling_steps
-                    if args.sampling_steps is not None
-                    else int(sampling["sampling_steps"])
+            failure_report = {
+                "format_version": 3,
+                "experiment": "dual_route_physics_controllable_csi_generation",
+                "status": "insufficient_eligible_candidates",
+                "generation_mode": route.mode.value,
+                "guidance_scale": route.guidance_scale,
+                "conditions": condition_dict,
+                "condition_validity": [True, True, k_valid, True],
+                "requested_samples": args.num_samples,
+                "candidate_samples_generated": candidate_samples,
+                "eligible_samples": eligible_candidate_samples,
+                "candidate_generation_round_sizes": generation_round_sizes,
+                "maximum_candidate_budget": maximum_candidate_samples,
+                "natural_angle_tolerance_deg": args.natural_angle_tolerance_deg,
+                "tolerance_was_relaxed": False,
+                "selection_policy": "uniform_random_without_replacement",
+                "map_id": args.map_id,
+                "path_count": args.path_count,
+                "target_mean_aod_az_deg": route.target_mean_aod_az_deg,
+                "message": (
+                    "Maximum candidate budget was exhausted without enough "
+                    "naturally eligible CSI; no output artifact was written."
                 ),
-                eta=float(sampling.get("eta", 0.0)),
-                guidance_scale=(
-                    args.guidance_scale
-                    if args.guidance_scale is not None
-                    else float(sampling["guidance_scale"])
-                ),
-                forced_path_count=args.path_count,
-                generator=generator,
+            }
+            atomic_json_dump(failure_report, report_path)
+            print(json.dumps(failure_report, indent=2, sort_keys=True), flush=True)
+            raise RuntimeError(
+                "insufficient naturally eligible Mean-AoD candidates at the "
+                "configured maximum budget"
             )
-            dp_output = dp(
-                base_batch, conditions_batch, validity_batch, map_index=map_index
-            )
-            dp_batch = dp.apply_to_payload(base_batch, dp_output)
-            link_output = link(
-                dp_batch, conditions_batch, validity_batch, map_index=map_index
-            )
-            natural_batch = link.apply_to_payload(dp_batch, link_output)
-            _append_payload(base_chunks, base_batch)
-            _append_payload(dp_chunks, dp_batch)
-            _append_payload(natural_chunks, natural_batch)
-            print(
-                json.dumps(
-                    {
-                        "event": "dual_mode_aod_candidate_progress",
-                        "complete": start + batch_samples,
-                        "total": candidate_samples,
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
+
         base = _finish_payload(base_chunks)
         dp_payload = _finish_payload(dp_chunks)
-        natural = _finish_payload(natural_chunks)
-        selection = None
-        selection_report: dict[str, Any] | None = None
-        selection_projector = AoDControlProjector(
-            minimum_mean_concentration=args.minimum_mean_concentration,
-            strongest_near_tie_margin=args.strongest_near_tie_margin,
-        )
-        if control_policy in {"realism_first", "exact_control"}:
-            if control_policy == "realism_first":
-                selection = select_aod_candidates_within_tolerance(
-                    natural,
-                    args.target_aod_az_deg,
-                    samples=args.num_samples,
-                    tolerance_deg=args.natural_angle_tolerance_deg,
-                    mode=args.aod_control_mode,
-                    projector=selection_projector,
-                    exclude_strongest_near_ties=args.exclude_strongest_near_ties,
-                )
-            else:
-                selection = select_nearest_aod_candidates(
-                    natural,
-                    args.target_aod_az_deg,
-                    samples=args.num_samples,
-                    mode=args.aod_control_mode,
-                    projector=selection_projector,
-                    exclude_strongest_near_ties=args.exclude_strongest_near_ties,
-                )
+        final_payload = _finish_payload(final_chunks)
+        selection_report: dict[str, Any] = {
+            "policy": "none",
+            "candidate_samples": candidate_samples,
+            "selected_samples": args.num_samples,
+        }
+        if apply_filter:
+            selection_seed = (
+                args.selection_seed
+                if args.selection_seed is not None
+                else args.seed + 1_000_003
+            )
+            selection = select_random_aod_candidates_within_tolerance(
+                final_payload,
+                route.target_mean_aod_az_deg,
+                samples=args.num_samples,
+                tolerance_deg=args.natural_angle_tolerance_deg,
+                mode="mean",
+                projector=projector,
+                generator=torch.Generator().manual_seed(selection_seed),
+            )
             base = select_payload_samples(base, selection.indices)
             dp_payload = select_payload_samples(dp_payload, selection.indices)
-            natural = select_payload_samples(natural, selection.indices)
-            selected_distance = selection.angular_distance_deg
+            final_payload = select_payload_samples(final_payload, selection.indices)
             selection_report = {
-                "policy": control_policy,
+                "policy": "uniform_random_among_natural_mean_aod_eligible",
                 "candidate_samples": selection.candidate_samples,
                 "eligible_samples": selection.eligible_samples,
-                "acceptance_rate": (
-                    selection.eligible_samples / selection.candidate_samples
-                ),
+                "acceptance_rate": selection.eligible_samples
+                / selection.candidate_samples,
                 "selected_samples": selection.requested_samples,
                 "unique_selected_samples": int(torch.unique(selection.indices).numel()),
                 "candidate_multiplier": args.candidate_multiplier,
-                "natural_angle_tolerance_deg": (
-                    args.natural_angle_tolerance_deg
-                    if control_policy == "realism_first"
-                    else None
-                ),
-                "pre_projection_angular_distance_deg": _audit(selected_distance),
-                "fraction_within_15_deg": float((selected_distance <= 15.0).float().mean()),
-                "fraction_within_45_deg": float((selected_distance <= 45.0).float().mean()),
-                "small_projection_threshold_deg": args.maximum_small_projection_deg,
-                "fraction_within_small_projection_threshold": float(
-                    (selected_distance <= args.maximum_small_projection_deg).float().mean()
-                ),
-                "selected_candidate_indices": selection.indices.detach().cpu().tolist(),
+                "candidate_top_up_size": args.candidate_top_up_size,
+                "maximum_candidate_multiplier": args.maximum_candidate_multiplier,
+                "maximum_candidate_budget": maximum_candidate_samples,
+                "candidate_generation_round_sizes": generation_round_sizes,
+                "natural_angle_tolerance_deg": args.natural_angle_tolerance_deg,
+                "tolerance_was_relaxed": False,
+                "selection_seed": selection_seed,
+                "selected_angle_error_deg": _audit(selection.angular_distance_deg),
+                "selected_candidate_indices": selection.indices.cpu().tolist(),
             }
-            if control_policy == "exact_control" and bool(
-                (selected_distance > args.maximum_small_projection_deg).any()
-            ):
-                raise RuntimeError(
-                    "candidate pool cannot satisfy the required small-projection threshold; "
-                    "increase --candidate-multiplier or relax the threshold"
-                )
-        else:
-            selection_report = {
-                "policy": "direct",
-                "candidate_samples": candidate_samples,
-                "selected_samples": args.num_samples,
-            }
-        conditions = condition_row.expand(args.num_samples, -1).clone()
-        validity = torch.ones_like(conditions, dtype=torch.bool)
-        validity[:, 2] = k_valid
-        synthesizer = MIMOOFDMSynthesizer(b3.synthesizer.config).to(device).eval()
-        natural_device = _to_device(natural, device)
-        natural_device["csi"] = _synthesize(natural_device, synthesizer)
-        natural = _cpu(natural_device)
-        control_output = None
-        projection_applied = False
-        if args.target_aod_az_deg is not None:
-            projector = AoDControlProjector(
-                minimum_mean_concentration=args.minimum_mean_concentration,
-                strongest_near_tie_margin=args.strongest_near_tie_margin,
-            )
-            control_output = projector(
-                natural_device,
-                args.target_aod_az_deg,
-                mode=args.aod_control_mode,
-            )
-            if control_policy == "realism_first":
-                controlled = dict(natural)
-            else:
-                projection_applied = True
-                controlled_device = projector.apply_to_payload(
-                    natural_device, control_output
-                )
-                controlled_device["csi"] = _synthesize(controlled_device, synthesizer)
-                controlled = _cpu(controlled_device)
-        else:
-            controlled = dict(natural)
-    elapsed = time.perf_counter() - started
 
-    preserve_keys = (
-        "path_mask",
-        "path_delays_ns",
-        "path_powers_linear",
-        "path_phases_rad",
-        "aoa_az_deg",
-        "aoa_el_deg",
-        "aod_el_deg",
-    )
-    preservation = {
-        key: (
-            float((controlled[key].float() - natural[key].float()).abs().max())
-            if controlled[key].is_floating_point()
-            else float((controlled[key] != natural[key]).float().max())
-        )
-        for key in preserve_keys
-    }
+        synthesizer = MIMOOFDMSynthesizer(active_model.synthesizer.config).to(device).eval()
+        dp_device = _to_device(dp_payload, device)
+        dp_device["csi"] = _synthesize(dp_device, synthesizer)
+        dp_payload = _cpu(dp_device)
+        final_device = _to_device(final_payload, device)
+        final_device["csi"] = _synthesize(final_device, synthesizer)
+        final_payload = _cpu(final_device)
+
+        control_report: dict[str, Any] | None = None
+        control_tensors: dict[str, torch.Tensor] | None = None
+        if route.target_mean_aod_az_deg is not None:
+            measurement = AoDControlProjector(
+                minimum_mean_concentration=args.minimum_mean_concentration
+            )(final_device, route.target_mean_aod_az_deg, mode="mean")
+            error = measurement.rotation_deg.abs()
+            control_report = {
+                "target_mean_aod_az_deg": route.target_mean_aod_az_deg,
+                "projection_applied": False,
+                "mean_aod_error_deg": _audit(error),
+                "hit_at_5_deg": float((error <= 5.0).float().mean()),
+                "hit_at_10_deg": float((error <= 10.0).float().mean()),
+                "valid_rate": float(measurement.control_valid.float().mean()),
+                "mean_resultant_concentration": _audit(
+                    measurement.mean_resultant_concentration
+                ),
+            }
+            control_tensors = {
+                "target_mean_aod_az_deg": measurement.target_az_deg,
+                "actual_mean_aod_az_deg": measurement.reference_before_deg,
+                "mean_aod_circular_error_deg": error,
+                "mean_aod_valid": measurement.control_valid,
+                "mean_aod_concentration": measurement.mean_resultant_concentration,
+            }
+
+    elapsed = time.perf_counter() - started
+    output_conditions = condition_row.expand(args.num_samples, -1).clone()
+    output_validity = torch.ones_like(output_conditions, dtype=torch.bool)
+    output_validity[:, 2] = k_valid
     support = _support_audit(
         args.support_cache,
         map_id=args.map_id,
-        conditions=conditions.detach().cpu(),
-        validity=validity.detach().cpu(),
+        conditions=output_conditions,
+        validity=output_validity,
         path_count=args.path_count,
     )
-    control_report: dict[str, Any] | None = None
-    control_tensors: dict[str, torch.Tensor] | None = None
-    if control_output is not None:
-        final_error = (
-            control_output.circular_error_deg
-            if projection_applied
-            else control_output.rotation_deg.abs()
-        )
-        control_report = {
-            "mode": control_output.mode,
-            "policy": control_policy,
-            "projection_applied": projection_applied,
-            "target_az_deg": args.target_aod_az_deg,
-            "natural_angle_error_deg": _audit(control_output.rotation_deg.abs()),
-            "final_angle_error_deg": _audit(final_error),
-            "rotation_absolute_deg": _audit(control_output.rotation_deg.abs()),
-            "valid_rate": float(control_output.control_valid.float().mean()),
-            "mean_resultant_concentration": _audit(
-                control_output.mean_resultant_concentration
+    pipeline = (
+        ["B3", "DP Residual", "Link-global AoD", "physics check", "CSI synthesis"]
+        if route.use_natural_b3
+        else [
+            f"AoD-conditioned B3 (CFG={route.guidance_scale:g})",
+            "DP Residual",
+            (
+                "bounded candidate top-up + natural Mean-AoD tolerance filter "
+                "+ uniform eligible sampling"
+                if apply_filter
+                else "no AoD filter"
             ),
-            "strongest_near_tie_rate": float(
-                control_output.strongest_near_tie.float().mean()
-            ),
-            "strongest_power_margin_fraction": _audit(
-                control_output.strongest_power_margin_fraction
-            ),
-        }
-        control_tensors = {
-            "target_az_deg": control_output.target_az_deg,
-            "reference_before_deg": control_output.reference_before_deg,
-            "reference_after_deg": (
-                control_output.reference_after_deg
-                if projection_applied
-                else control_output.reference_before_deg
-            ),
-            "requested_rotation_deg": control_output.rotation_deg,
-            "applied_rotation_deg": (
-                control_output.rotation_deg
-                if projection_applied
-                else torch.zeros_like(control_output.rotation_deg)
-            ),
-            "final_circular_error_deg": final_error,
-            "control_valid": control_output.control_valid,
-            "mean_resultant_concentration": control_output.mean_resultant_concentration,
-            "strongest_path_index": control_output.strongest_path_index,
-            "strongest_power_margin_fraction": control_output.strongest_power_margin_fraction,
-            "strongest_near_tie": control_output.strongest_near_tie,
-        }
+            "physics check",
+            "CSI synthesis",
+        ]
+    )
+    checkpoint_paths = {
+        "dp": str(Path(args.dp_checkpoint).resolve()),
+        "b3": str(Path(args.b3_checkpoint).resolve()) if args.b3_checkpoint else None,
+        "aod_conditioned_b3": (
+            str(Path(args.aod_checkpoint).resolve()) if args.aod_checkpoint else None
+        ),
+        "link_global": (
+            str(Path(args.link_checkpoint).resolve()) if args.link_checkpoint else None
+        ),
+    }
     artifact = {
-        "format_version": 1,
-        "model_kind": "b3_dp_link_global_dual_mode_aod_control",
+        "format_version": 3,
+        "model_kind": "dual_route_physics_controllable_csi_generator",
+        "generation_mode": route.mode.value,
+        "pipeline": pipeline,
         "conditions": condition_dict,
-        "condition_validity": validity[0].detach().cpu(),
+        "condition_validity": output_validity[0],
         "map_id": args.map_id,
         "path_count": args.path_count,
+        "target_mean_aod_az_deg": route.target_mean_aod_az_deg,
         "seed": args.seed,
-        "control_mode": args.aod_control_mode if control_output is not None else "natural",
-        "control_policy": control_policy,
-        "target_aod_az_deg": args.target_aod_az_deg,
         "base": _cpu(base),
         "dp_only": _cpu(dp_payload),
-        "natural": _cpu(natural),
-        "controlled": _cpu(controlled),
+        "generated": _cpu(final_payload),
         "control_audit": _cpu(control_tensors),
         "selection_audit": selection_report,
-        "checkpoint_paths": {
-            "b3": str(Path(args.b3_checkpoint).resolve()),
-            "dp": str(Path(args.dp_checkpoint).resolve()),
-            "link_global": str(Path(args.link_checkpoint).resolve()),
-        },
+        "checkpoint_paths": checkpoint_paths,
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(output.suffix + ".tmp")
     torch.save(artifact, temporary)
     temporary.replace(output)
+
     report = {
-        "format_version": 1,
-        "experiment": "dual_mode_aod_control_generation",
+        "format_version": 3,
+        "experiment": "dual_route_physics_controllable_csi_generation",
+        "status": "success",
         "artifact": str(output.resolve()),
+        "generation_mode": route.mode.value,
+        "pipeline": pipeline,
         "samples": args.num_samples,
         "candidate_samples": candidate_samples,
         "seconds": elapsed,
         "samples_per_second": args.num_samples / max(elapsed, 1e-20),
         "conditions": condition_dict,
-        "condition_validity": validity[0].detach().cpu().tolist(),
+        "condition_validity": output_validity[0].tolist(),
         "map_id": args.map_id,
         "path_count": args.path_count,
         "selection": selection_report,
         "control": control_report,
-        "preservation_maximum_absolute_error": preservation,
         "scene_condition_support": support,
-        "interpretation": (
-            "Numerical control accuracy does not establish Map-conditional realism. Treat "
-            "low/out-of-support conditions as controllable extrapolations only."
+        "checkpoint_paths": checkpoint_paths,
+        "limitations": (
+            [
+                "Mean-AoD mode is currently trained and validated only for L=5.",
+                "Natural tolerance filtering enforces output tolerance without angle rotation.",
+                "Eligible candidates are sampled uniformly without replacement, not ranked by angular error.",
+                "Candidate top-up is bounded and never relaxes the requested angle tolerance.",
+                "Low-support Map-condition-angle requests remain extrapolations.",
+            ]
+            if route.use_aod_conditioned_b3
+            else []
         ),
     }
     report_path = Path(args.report) if args.report else output.with_suffix(".json")

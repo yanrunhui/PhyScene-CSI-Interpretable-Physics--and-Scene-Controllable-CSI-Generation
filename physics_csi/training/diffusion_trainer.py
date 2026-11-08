@@ -84,6 +84,9 @@ class DiffusionTrainer:
         patience_counter = 0
         for epoch in range(self.start_epoch, int(self.config["epochs"])):
             started = time.monotonic()
+            train_sampler = getattr(loaders["train"], "sampler", None)
+            if hasattr(train_sampler, "set_epoch"):
+                train_sampler.set_epoch(epoch)
             train_metrics = self._run_epoch(loaders["train"], train=True)
             validation_metrics = self._run_epoch(loaders["validation"], train=False)
             self.scheduler.step(validation_metrics["loss"])
@@ -141,6 +144,15 @@ class DiffusionTrainer:
                         metrics["scene_gradient_norm"] = scene_gradient_norm
                         metrics["scene_gradient_nonzero"] = (
                             scene_gradient_norm > 0.0
+                        ).float()
+                    aod_gradient_norm = getattr(
+                        self.model, "aod_condition_gradient_norm", lambda: None
+                    )()
+                    if aod_gradient_norm is not None:
+                        metrics = dict(metrics)
+                        metrics["aod_condition_gradient_norm"] = aod_gradient_norm
+                        metrics["aod_condition_gradient_nonzero"] = (
+                            aod_gradient_norm > 0.0
                         ).float()
                     gradient_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), float(self.config.get("gradient_clip_norm", 1.0))
@@ -205,6 +217,13 @@ class DiffusionTrainer:
             ):
                 raise RuntimeError(
                     "scene-conditioning parameters received no gradients during the epoch"
+                )
+            if (
+                bool(getattr(self.model, "aod_conditioning_enabled", False))
+                and result.get("aod_condition_gradient_nonzero", 0.0) == 0.0
+            ):
+                raise RuntimeError(
+                    "AoD-conditioning parameters received no gradients during the epoch"
                 )
         return result
 

@@ -55,6 +55,12 @@ def main() -> None:
     parser.add_argument("--sampling-steps", type=int, default=None)
     parser.add_argument("--guidance-scale", type=float, default=None)
     parser.add_argument("--path-count", type=int, default=None)
+    parser.add_argument(
+        "--mean-aod-az-deg",
+        type=float,
+        default=None,
+        help="Continuous power-weighted Mean AoD azimuth target in degrees.",
+    )
     parser.add_argument("--path-count-temperature", type=float, default=None)
     parser.add_argument(
         "--skip-support-check",
@@ -69,6 +75,7 @@ def main() -> None:
         "multipath_diffusion_scene_id_spatial",
         "multipath_diffusion_scene_residual",
         "multipath_diffusion_scene_residual_spatial",
+        "multipath_diffusion_scene_id_aod_conditioned",
     }
     if checkpoint.get("model_kind") not in scene_kinds:
         raise ValueError("checkpoint is not a supported scene-aware model")
@@ -91,6 +98,20 @@ def main() -> None:
         "k_factor_db": args.k_factor_db,
         "los_status": args.los_status,
     }
+    aod_conditioned = bool(
+        config["multipath_diffusion"].get("aod_conditioning", {}).get("enabled", False)
+    )
+    if aod_conditioned and args.mean_aod_az_deg is None:
+        raise ValueError("--mean-aod-az-deg is required by this checkpoint")
+    trained_path_count = config.get("aod_conditioned_data", {}).get("path_count")
+    forced_path_count = args.path_count
+    if aod_conditioned and trained_path_count is not None:
+        if forced_path_count is None:
+            forced_path_count = int(trained_path_count)
+        elif forced_path_count != int(trained_path_count):
+            raise ValueError(
+                f"first-stage AoD model was trained only for L={trained_path_count}"
+            )
     support: dict[str, Any] | None = None
     if not args.skip_support_check:
         datasets = make_scene_id_datasets(config["data"]["prepared_root"], plan)
@@ -123,7 +144,8 @@ def main() -> None:
             if args.path_count_temperature is not None
             else float(sampling.get("path_count_temperature", 1.0))
         ),
-        forced_path_count=args.path_count,
+        forced_path_count=forced_path_count,
+        mean_aod_az_deg=args.mean_aod_az_deg,
         generator=generator,
     )
     elapsed = time.perf_counter() - started
@@ -135,6 +157,8 @@ def main() -> None:
             "model_kind": checkpoint["model_kind"],
             "generated": _cpu(generated),
             "conditions": conditions,
+            "mean_aod_az_deg": args.mean_aod_az_deg,
+            "forced_path_count": forced_path_count,
             "map_id": args.map_id,
             "map_name": f"map_{args.map_id}",
             "scene_condition_support": support,
@@ -149,7 +173,7 @@ def main() -> None:
                     if args.guidance_scale is not None
                     else float(sampling["guidance_scale"])
                 ),
-                "forced_path_count": args.path_count,
+                "forced_path_count": forced_path_count,
             },
             "checkpoint": str(Path(args.checkpoint).resolve()),
             "scene_plan_fingerprint": plan["fingerprint"],

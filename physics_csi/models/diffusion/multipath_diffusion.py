@@ -8,7 +8,10 @@ from torch import nn
 from torch.nn import functional as F
 
 from physics_csi.models.blocks import mask_from_path_count
-from physics_csi.models.diffusion.condition_encoder import ConditionEncoder
+from physics_csi.models.diffusion.condition_encoder import (
+    CircularAoDConditionFusion,
+    ConditionEncoder,
+)
 from physics_csi.models.diffusion.multipath_denoiser import MultipathDenoiser
 from physics_csi.models.diffusion.multipath_representation import MultipathRepresentation
 from physics_csi.models.diffusion.noise_schedule import GaussianDiffusion
@@ -41,6 +44,15 @@ class MultipathDiffusionModel(nn.Module):
         self.condition_encoder = ConditionEncoder(
             statistics["condition_mean"], statistics["condition_std"], condition_dim, hidden_dim
         )
+        aod_config = dict(config.get("aod_conditioning", {}))
+        self.aod_conditioning_enabled = bool(aod_config.get("enabled", False))
+        self.aod_conditioner: CircularAoDConditionFusion | None = None
+        if self.aod_conditioning_enabled:
+            self.aod_conditioner = CircularAoDConditionFusion(
+                condition_dim,
+                int(aod_config.get("hidden_dim", hidden_dim)),
+                float(aod_config.get("dropout", config.get("dropout", 0.0))),
+            )
         scene_config = dict(config.get("scene_conditioning", {}))
         adapter_config = dict(config.get("scene_residual_adapter", {}))
         self.scene_conditioning_enabled = bool(scene_config.get("enabled", False))
@@ -124,6 +136,7 @@ class MultipathDiffusionModel(nn.Module):
         self.spatial_supervision_enabled = bool(
             self.spatial_supervision.get("enabled", False)
         )
+        self.aod_conditioning = aod_config
         count_config = dict(config.get("path_count", {}))
         counts = torch.as_tensor(
             statistics.get("path_count_histogram", [0] + [1] * self.max_paths),
@@ -156,6 +169,11 @@ class MultipathDiffusionModel(nn.Module):
                 self.denoiser,
             ):
                 module.requires_grad_(False)
+        self.freeze_path_count_model = bool(
+            config.get("freeze_path_count_model", False)
+        )
+        if self.freeze_path_count_model:
+            self.path_count_model.requires_grad_(False)
 
     def _path_count_logit_bias(self) -> torch.Tensor | None:
         if not self.path_count_prior_correction:
@@ -235,6 +253,8 @@ class MultipathDiffusionModel(nn.Module):
             self.condition_encoder.eval()
             self.path_count_model.eval()
             self.denoiser.eval()
+        if self.freeze_path_count_model:
+            self.path_count_model.eval()
         return self
 
     def condition_embedding(
@@ -242,14 +262,32 @@ class MultipathDiffusionModel(nn.Module):
         conditions: torch.Tensor,
         validity: torch.Tensor | None = None,
         *,
+        mean_aod_az_deg: torch.Tensor | None = None,
+        mean_aod_validity: torch.Tensor | None = None,
         map_id: int | torch.Tensor | None = None,
         map_index: torch.Tensor | None = None,
         drop_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Encode the complete condition used by both count and denoising branches."""
-        if not self.scene_conditioning_enabled:
-            return self.condition_encoder(conditions, validity, drop_mask=drop_mask)
         physical = self.condition_encoder(conditions, validity)
+        if self.aod_conditioning_enabled:
+            if mean_aod_az_deg is None:
+                raise ValueError("Mean AoD is required by an AoD-conditioned model")
+            if mean_aod_validity is None:
+                mean_aod_validity = torch.ones(
+                    conditions.shape[0], device=conditions.device, dtype=torch.bool
+                )
+            assert self.aod_conditioner is not None
+            physical = self.aod_conditioner(
+                physical,
+                mean_aod_az_deg,
+                mean_aod_validity,
+                drop_mask=None if self.scene_conditioning_enabled else drop_mask,
+            )
+        elif not self.scene_conditioning_enabled:
+            return self.condition_encoder(conditions, validity, drop_mask=drop_mask)
+        if not self.scene_conditioning_enabled:
+            return physical
         resolved = self.map_indices(
             map_id, conditions.shape[0], conditions.device, map_index=map_index
         )
@@ -262,6 +300,9 @@ class MultipathDiffusionModel(nn.Module):
         if self.scene_conditioning_enabled:
             assert self.scene_conditioner is not None
             return self.scene_conditioner.unconditional(batch_size, device)
+        if self.aod_conditioning_enabled:
+            assert self.aod_conditioner is not None
+            return self.aod_conditioner.unconditional(batch_size, device)
         return self.condition_encoder.unconditional(batch_size, device)
 
     def path_count_logits(
@@ -331,9 +372,23 @@ class MultipathDiffusionModel(nn.Module):
             return torch.zeros((), device=next(self.parameters()).device)
         return torch.stack(squares).sum().sqrt()
 
+    def aod_condition_gradient_norm(self) -> torch.Tensor | None:
+        if self.aod_conditioner is None:
+            return None
+        squares = [
+            parameter.grad.detach().float().square().sum()
+            for parameter in self.aod_conditioner.parameters()
+            if parameter.grad is not None
+        ]
+        if not squares:
+            return torch.zeros((), device=next(self.parameters()).device)
+        return torch.stack(squares).sum().sqrt()
+
     def forward(self, batch: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         conditions = batch["conditions"]
         validity = batch.get("condition_validity")
+        mean_aod_az_deg = batch.get("mean_aod_az_deg")
+        mean_aod_validity = batch.get("mean_aod_valid")
         map_id = batch.get("map_id")
         map_index = batch.get("map_index")
         resolved_map_index = self.map_indices(
@@ -345,6 +400,8 @@ class MultipathDiffusionModel(nn.Module):
         full_condition = self.condition_embedding(
             conditions,
             validity,
+            mean_aod_az_deg=mean_aod_az_deg,
+            mean_aod_validity=mean_aod_validity,
             map_id=map_id,
             map_index=resolved_map_index,
         )
@@ -372,6 +429,8 @@ class MultipathDiffusionModel(nn.Module):
         train_condition = self.condition_embedding(
             conditions,
             validity,
+            mean_aod_az_deg=mean_aod_az_deg,
+            mean_aod_validity=mean_aod_validity,
             map_id=map_id,
             map_index=resolved_map_index,
             drop_mask=drop_mask,
@@ -406,6 +465,25 @@ class MultipathDiffusionModel(nn.Module):
                 count_logits.argmax(-1) == path_count - 1
             ).float().mean(),
         }
+        if self.aod_conditioning_enabled:
+            if mean_aod_az_deg is None:
+                raise KeyError("AoD-conditioned training batch has no Mean-AoD label")
+            angle_auxiliary = self._aod_condition_auxiliary(
+                prediction["predicted_clean"],
+                prediction["timestep"],
+                batch,
+                mean_aod_az_deg,
+                mean_aod_validity,
+                drop_mask,
+            )
+            angle_weight = float(self.aod_conditioning.get("loss_weight", 0.0))
+            result.update(angle_auxiliary)
+            result["aod_condition_auxiliary_weighted"] = (
+                angle_weight * angle_auxiliary["aod_condition_loss"]
+            )
+            result["loss"] = (
+                result["loss"] + result["aod_condition_auxiliary_weighted"]
+            )
         if self.spatial_supervision_enabled:
             auxiliary = self._spatial_auxiliary_losses(
                 prediction["predicted_clean"],
@@ -423,8 +501,67 @@ class MultipathDiffusionModel(nn.Module):
             )
             result.update(auxiliary)
             result["spatial_auxiliary_weighted"] = weighted_auxiliary
-            result["loss"] = total_loss + weighted_auxiliary
+            result["loss"] = result["loss"] + weighted_auxiliary
         return result
+
+    def _aod_condition_auxiliary(
+        self,
+        predicted_clean: torch.Tensor,
+        timesteps: torch.Tensor,
+        batch: Mapping[str, torch.Tensor],
+        target_mean_aod_deg: torch.Tensor,
+        target_validity: torch.Tensor | None,
+        drop_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        maximum_fraction = float(
+            self.aod_conditioning.get("maximum_timestep_fraction", 0.10)
+        )
+        if not 0.0 < maximum_fraction <= 1.0:
+            raise ValueError("AoD maximum_timestep_fraction must be in (0, 1]")
+        maximum_timestep = max(0, int(self.diffusion.timesteps * maximum_fraction) - 1)
+        valid = (
+            torch.ones_like(target_mean_aod_deg, dtype=torch.bool)
+            if target_validity is None
+            else target_validity.bool()
+        )
+        selected = (timesteps <= maximum_timestep) & ~drop_mask.bool() & valid
+        selected_fraction = selected.float().mean()
+        if not bool(selected.any()):
+            zero = predicted_clean.sum() * 0.0
+            return {
+                "aod_condition_loss": zero,
+                "aod_condition_error_deg": zero,
+                "aod_condition_supervision_fraction": selected_fraction,
+            }
+        clipped = predicted_clean[selected].clamp(
+            -float(self.config.get("clip_denoised", 5.0)),
+            float(self.config.get("clip_denoised", 5.0)),
+        )
+        path_mask = batch["path_mask"][selected].bool()
+        raw = self.representation.decode(clipped, path_mask)
+        weights = raw["positive_power_weights"] * raw["path_mask"]
+        weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-20)
+        predicted_rad = torch.deg2rad(raw["aod_az_deg"])
+        predicted_direction = torch.stack(
+            [
+                (weights * predicted_rad.sin()).sum(-1),
+                (weights * predicted_rad.cos()).sum(-1),
+            ],
+            dim=-1,
+        )
+        predicted_direction = predicted_direction / predicted_direction.norm(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-6)
+        target_rad = torch.deg2rad(target_mean_aod_deg[selected].float())
+        target_direction = torch.stack([target_rad.sin(), target_rad.cos()], dim=-1)
+        cosine = (predicted_direction * target_direction).sum(-1).clamp(-1.0, 1.0)
+        return {
+            "aod_condition_loss": (1.0 - cosine).mean(),
+            "aod_condition_error_deg": torch.rad2deg(
+                torch.acos(cosine.detach())
+            ).mean(),
+            "aod_condition_supervision_fraction": selected_fraction,
+        }
 
     def _spatial_auxiliary_losses(
         self,
@@ -503,11 +640,21 @@ class MultipathDiffusionModel(nn.Module):
         guidance_scale: float = 1.0,
         path_count_temperature: float = 1.0,
         forced_path_count: int | torch.Tensor | None = None,
+        mean_aod_az_deg: float | torch.Tensor | None = None,
+        mean_aod_validity: bool | torch.Tensor | None = None,
         generator: torch.Generator | None = None,
         map_id: int | torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         condition_tensor, validity = self._prepare_conditions(
             conditions, num_samples, condition_validity
+        )
+        if isinstance(conditions, Mapping) and mean_aod_az_deg is None:
+            mean_aod_az_deg = conditions.get("mean_aod_az_deg")
+        aod_target, aod_validity = self._prepare_aod_condition(
+            mean_aod_az_deg,
+            mean_aod_validity,
+            num_samples,
+            condition_tensor.device,
         )
         resolved_map_index = self.map_indices(
             map_id, num_samples, condition_tensor.device
@@ -515,6 +662,8 @@ class MultipathDiffusionModel(nn.Module):
         embedding = self.condition_embedding(
             condition_tensor,
             validity,
+            mean_aod_az_deg=aod_target,
+            mean_aod_validity=aod_validity,
             map_id=map_id,
             map_index=resolved_map_index,
         )
@@ -662,6 +811,23 @@ class MultipathDiffusionModel(nn.Module):
                 parameterized_power_fraction - raw_power_fraction
             ).abs().sum(-1),
         }
+        if self.aod_conditioning_enabled:
+            assert aod_target is not None and aod_validity is not None
+            actual_mean_aod, actual_concentration = self._mean_aod(
+                constrained.powers_linear,
+                raw["aod_az_deg"],
+                raw["path_mask"],
+            )
+            result["target_mean_aod_az_deg"] = aod_target
+            result["target_mean_aod_validity"] = aod_validity
+            result["actual_mean_aod_az_deg"] = actual_mean_aod
+            result["actual_mean_aod_concentration"] = actual_concentration
+            result["mean_aod_circular_error_deg"] = torch.rad2deg(
+                torch.atan2(
+                    torch.sin(torch.deg2rad(actual_mean_aod - aod_target)),
+                    torch.cos(torch.deg2rad(actual_mean_aod - aod_target)),
+                )
+            ).abs()
         if "path_delays_ns" in raw:
             result["raw_path_delays_ns"] = raw["path_delays_ns"]
         if "relative_delay_shape" in raw:
@@ -675,6 +841,51 @@ class MultipathDiffusionModel(nn.Module):
             if result["map_id"].shape[0] == 1:
                 result["map_id"] = result["map_id"].expand(num_samples)
         return result
+
+    @staticmethod
+    def _mean_aod(
+        powers_linear: torch.Tensor,
+        aod_az_deg: torch.Tensor,
+        path_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        powers = powers_linear * path_mask.bool()
+        weights = powers / powers.sum(-1, keepdim=True).clamp_min(1e-20)
+        radians = torch.deg2rad(aod_az_deg)
+        sine = (weights * radians.sin()).sum(-1)
+        cosine = (weights * radians.cos()).sum(-1)
+        concentration = torch.sqrt(sine.square() + cosine.square()).clamp(0.0, 1.0)
+        return torch.rad2deg(torch.atan2(sine, cosine)), concentration
+
+    def _prepare_aod_condition(
+        self,
+        value: float | torch.Tensor | None,
+        validity: bool | torch.Tensor | None,
+        num_samples: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if not self.aod_conditioning_enabled:
+            return None, None
+        if value is None:
+            raise ValueError("mean_aod_az_deg is required by this checkpoint")
+        angle = torch.as_tensor(value, device=device, dtype=torch.float32).reshape(-1)
+        if angle.shape[0] == 1:
+            angle = angle.expand(num_samples)
+        if angle.shape != (num_samples,):
+            raise ValueError("mean_aod_az_deg must be scalar or have shape [num_samples]")
+        if not bool(torch.isfinite(angle).all()):
+            raise ValueError("mean_aod_az_deg must be finite")
+        angle = torch.rad2deg(
+            torch.atan2(torch.sin(torch.deg2rad(angle)), torch.cos(torch.deg2rad(angle)))
+        )
+        if validity is None:
+            valid = torch.ones(num_samples, device=device, dtype=torch.bool)
+        else:
+            valid = torch.as_tensor(validity, device=device, dtype=torch.bool).reshape(-1)
+            if valid.shape[0] == 1:
+                valid = valid.expand(num_samples)
+            if valid.shape != (num_samples,):
+                raise ValueError("mean_aod_validity must be scalar or [num_samples]")
+        return angle, valid
 
     def _prepare_conditions(
         self,

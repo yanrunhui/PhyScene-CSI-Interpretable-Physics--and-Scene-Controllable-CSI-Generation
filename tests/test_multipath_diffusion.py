@@ -217,6 +217,73 @@ def test_scene_id_generation_rejects_unseen_map() -> None:
     assert generated["map_index"].tolist() == [1, 1]
 
 
+def test_aod_conditioned_diffusion_is_periodic_and_receives_gradients() -> None:
+    config = _config()
+    config["condition_dropout"] = 0.0
+    config["aod_conditioning"] = {
+        "enabled": True,
+        "hidden_dim": 32,
+        "loss_weight": 0.1,
+        "maximum_timestep_fraction": 1.0,
+    }
+    config["scene_conditioning"] = {
+        "enabled": True,
+        "embedding_dim": 8,
+        "fusion_hidden_dim": 32,
+        "map_id_to_index": {"0": 0, "7": 1},
+    }
+    model = MultipathDiffusionModel(
+        config,
+        SystemConfig(num_subcarriers=8, tx_array_shape=(2, 2)),
+        _stats(),
+    )
+    physical = _batch()["conditions"][:1].expand(2, -1)
+    validity = _batch()["condition_validity"][:1].expand(2, -1)
+    periodic = model.condition_embedding(
+        physical,
+        validity,
+        mean_aod_az_deg=torch.tensor([-180.0, 180.0]),
+        mean_aod_validity=torch.ones(2, dtype=torch.bool),
+        map_id=torch.tensor([0, 0]),
+    )
+    assert torch.allclose(periodic[0], periodic[1], atol=1e-6)
+
+    batch = _batch()
+    batch["map_id"] = torch.tensor([0, 7])
+    batch["mean_aod_az_deg"] = torch.tensor([90.0, -45.0])
+    batch["mean_aod_valid"] = torch.ones(2, dtype=torch.bool)
+    metrics = model(batch)
+    assert set(metrics) >= {
+        "aod_condition_loss",
+        "aod_condition_error_deg",
+        "aod_condition_supervision_fraction",
+    }
+    assert all(torch.isfinite(value) for value in metrics.values())
+    metrics["loss"].backward()
+    gradient = model.aod_condition_gradient_norm()
+    assert gradient is not None and float(gradient) > 0.0
+
+    model.eval()
+    conditions = {
+        "total_power_db": -80.0,
+        "delay_spread_ns": 10.0,
+        "k_factor_db": 3.0,
+        "los_status": 1,
+    }
+    generated = model.generate(
+        conditions,
+        2,
+        map_id=7,
+        mean_aod_az_deg=38.5,
+        forced_path_count=3,
+        sampling_steps=2,
+        generator=torch.Generator().manual_seed(31),
+    )
+    assert generated["target_mean_aod_az_deg"].tolist() == [38.5, 38.5]
+    assert generated["mean_aod_circular_error_deg"].shape == (2,)
+    assert torch.isfinite(generated["actual_mean_aod_az_deg"]).all()
+
+
 def test_paired_spatial_losses_are_zero_for_identical_csi() -> None:
     generator = torch.Generator().manual_seed(17)
     real = torch.randn(3, 1, 4, 8, generator=generator)

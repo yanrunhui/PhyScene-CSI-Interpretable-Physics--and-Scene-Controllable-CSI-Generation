@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from physics_csi.config import deep_merge, load_yaml
+from physics_csi.data.aod_conditioned import make_aod_conditioned_datasets
 from physics_csi.data.diffusion_stats import load_or_compute_diffusion_statistics
 from physics_csi.data.scene_id import (
     load_seen_map_spatial_plan,
@@ -39,6 +40,8 @@ def _load_compatible_weights(
         "multipath_diffusion_scene_id_spatial",
         "multipath_diffusion_scene_residual",
         "multipath_diffusion_scene_residual_spatial",
+        "multipath_diffusion_scene_id_aod_conditioned",
+        "multipath_diffusion_aod_conditioned",
     }
     if checkpoint.get("model_kind") not in supported:
         raise ValueError("--initialize-from points to an unsupported checkpoint")
@@ -61,6 +64,12 @@ def _load_compatible_weights(
 
 
 def _model_kind(model: MultipathDiffusionModel) -> str:
+    if model.aod_conditioning_enabled:
+        return (
+            "multipath_diffusion_scene_id_aod_conditioned"
+            if model.scene_conditioning_enabled
+            else "multipath_diffusion_aod_conditioned"
+        )
     if model.scene_adapter_enabled:
         return (
             "multipath_diffusion_scene_residual_spatial"
@@ -91,6 +100,12 @@ def main() -> None:
     parser.add_argument("--resume", default=None)
     parser.add_argument("--checkpoint-dir", default=None)
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Override the training seed for a new run; ignored seeds are never changed on resume.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Run one forward/backward batch and exit without writing a checkpoint.",
@@ -120,9 +135,16 @@ def main() -> None:
         raise ValueError("use only one initialization argument")
     if args.resume and initialize_from:
         raise ValueError("--resume and --initialize-from are mutually exclusive")
+    if args.resume and args.seed is not None:
+        raise ValueError("--seed cannot be changed while resuming a checkpoint")
     resume_checkpoint = (
         torch.load(args.resume, map_location="cpu", weights_only=False)
         if args.resume
+        else None
+    )
+    initialization_checkpoint = (
+        torch.load(initialize_from, map_location="cpu", weights_only=False)
+        if initialize_from
         else None
     )
     config = copy.deepcopy(
@@ -155,15 +177,56 @@ def main() -> None:
             raise ValueError("checkpoint has no embedded scene-ID experiment plan")
     if args.checkpoint_dir:
         config["train"]["checkpoint_dir"] = args.checkpoint_dir
+    if args.seed is not None:
+        config["train"]["seed"] = args.seed
     train = config["train"]
     seed_everything(int(train["seed"]))
     prepared_root = config["data"]["prepared_root"]
     datasets = make_scene_id_datasets(prepared_root, plan)
+    aod_data_config = dict(config.get("aod_conditioned_data", {}))
+    if bool(config["multipath_diffusion"].get("aod_conditioning", {}).get("enabled", False)):
+        datasets = make_aod_conditioned_datasets(
+            datasets,
+            path_count=(
+                int(aod_data_config["path_count"])
+                if aod_data_config.get("path_count") is not None
+                else None
+            ),
+            minimum_concentration=float(
+                aod_data_config.get("minimum_concentration", 0.10)
+            ),
+            reject_low_concentration=bool(
+                aod_data_config.get("reject_low_concentration", True)
+            ),
+        )
+        config["aod_dataset_audit"] = {
+            split: dataset.audit() for split, dataset in datasets.items()
+        }
+        print(
+            json.dumps(
+                {"event": "aod_dataset_audit", **config["aod_dataset_audit"]},
+                indent=2,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
     system = SystemConfig.from_mapping(config["data"]["system"])
-    statistics = (
-        resume_checkpoint["statistics"]
-        if resume_checkpoint is not None
-        else load_or_compute_diffusion_statistics(
+    reuse_initialization_statistics = bool(
+        config["multipath_diffusion"]
+        .get("aod_conditioning", {})
+        .get("reuse_initialization_statistics", True)
+    )
+    if resume_checkpoint is not None:
+        statistics = resume_checkpoint["statistics"]
+    elif reuse_initialization_statistics and initialization_checkpoint is not None:
+        statistics = initialization_checkpoint["statistics"]
+        config["statistics_source"] = {
+            "kind": "initialization_checkpoint",
+            "checkpoint": str(Path(initialize_from).resolve()),
+            "reason": "preserve B3 normalization during AoD-conditioned fine-tuning",
+        }
+    else:
+        statistics = load_or_compute_diffusion_statistics(
             config["statistics_path"],
             prepared_root,
             system,
@@ -172,7 +235,6 @@ def main() -> None:
             dataset=datasets["train"],
             source_identity=f"seen_map_spatial:{plan['fingerprint']}",
         )
-    )
     if args.dry_run_batch_size <= 0:
         raise ValueError("--dry-run-batch-size must be positive")
     loader_batch_size = (
@@ -185,14 +247,23 @@ def main() -> None:
         datasets,
         batch_size=loader_batch_size,
         num_workers=loader_workers,
+        training_block_shuffle_size=(
+            int(aod_data_config.get("training_shuffle_block_size", 2048))
+            if bool(
+                config["multipath_diffusion"]
+                .get("aod_conditioning", {})
+                .get("enabled", False)
+            )
+            else None
+        ),
+        training_seed=int(train["seed"]),
     )
     model = MultipathDiffusionModel(
         config["multipath_diffusion"], system, statistics
     )
     if initialize_from:
-        source_checkpoint = torch.load(
-            initialize_from, map_location="cpu", weights_only=False
-        )
+        assert initialization_checkpoint is not None
+        source_checkpoint = initialization_checkpoint
         source_plan = source_checkpoint.get("config", {}).get("scene_id_experiment")
         if source_plan is not None and source_plan.get("fingerprint") != plan["fingerprint"]:
             raise ValueError("initialization checkpoint uses a different scene split")

@@ -8,6 +8,7 @@ from physics_csi.physics.aod_control import (
     select_aod_candidates_within_tolerance,
     select_nearest_aod_candidates,
     select_payload_samples,
+    select_random_aod_candidates_within_tolerance,
 )
 
 
@@ -113,3 +114,33 @@ def test_tolerance_selection_preserves_generation_order_without_projection() -> 
     assert selection.indices.tolist() == [0, 1, 3]
     assert torch.all(selection.angular_distance_deg <= 5.0)
     assert selection.eligible_samples == 3
+
+
+def test_random_tolerance_selection_is_uniformly_seeded_and_unique() -> None:
+    payload = _payload(
+        [[86.0], [91.0], [84.0], [94.0], [89.0], [92.0]],
+        [[1.0]] * 6,
+    )
+    projector = AoDControlProjector(minimum_mean_concentration=0.0)
+    first = select_random_aod_candidates_within_tolerance(
+        payload,
+        90.0,
+        samples=3,
+        tolerance_deg=10.0,
+        mode="mean",
+        projector=projector,
+        generator=torch.Generator().manual_seed(2026),
+    )
+    repeated = select_random_aod_candidates_within_tolerance(
+        payload,
+        90.0,
+        samples=3,
+        tolerance_deg=10.0,
+        mode="mean",
+        projector=projector,
+        generator=torch.Generator().manual_seed(2026),
+    )
+
+    assert torch.equal(first.indices, repeated.indices)
+    assert int(torch.unique(first.indices).numel()) == 3
+    assert first.indices.tolist() != [4, 1, 5]

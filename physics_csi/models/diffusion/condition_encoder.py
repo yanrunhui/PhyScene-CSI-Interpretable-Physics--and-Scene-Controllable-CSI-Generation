@@ -66,6 +66,60 @@ class ConditionEncoder(nn.Module):
         return self.null_embedding.to(device).unsqueeze(0).expand(batch_size, -1)
 
 
+class CircularAoDConditionFusion(nn.Module):
+    """Fuse a continuous circular Mean-AoD target into a physical embedding."""
+
+    def __init__(
+        self, embedding_dim: int, hidden_dim: int, dropout: float = 0.0
+    ) -> None:
+        super().__init__()
+        self.fusion = nn.Sequential(
+            nn.Linear(embedding_dim + 3, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embedding_dim),
+        )
+        final = self.fusion[-1]
+        assert isinstance(final, nn.Linear)
+        nn.init.normal_(final.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(final.bias)
+        self.null_embedding = nn.Parameter(torch.zeros(embedding_dim))
+
+    def forward(
+        self,
+        physical_embedding: torch.Tensor,
+        mean_aod_az_deg: torch.Tensor,
+        validity: torch.Tensor,
+        *,
+        drop_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if physical_embedding.ndim != 2:
+            raise ValueError("physical embedding must have shape [batch, dimension]")
+        angle = mean_aod_az_deg.to(
+            device=physical_embedding.device, dtype=physical_embedding.dtype
+        ).reshape(-1)
+        valid = validity.to(device=physical_embedding.device, dtype=torch.bool).reshape(-1)
+        if angle.shape[0] != physical_embedding.shape[0] or valid.shape != angle.shape:
+            raise ValueError("Mean-AoD condition must contain one value per batch item")
+        radians = torch.deg2rad(angle)
+        circular = torch.stack([radians.sin(), radians.cos()], dim=-1)
+        circular = torch.where(valid.unsqueeze(-1), circular, torch.zeros_like(circular))
+        features = torch.cat([circular, valid.to(circular).unsqueeze(-1)], dim=-1)
+        fused = physical_embedding + self.fusion(
+            torch.cat([physical_embedding, features], dim=-1)
+        )
+        if drop_mask is not None:
+            drop = drop_mask.to(device=fused.device, dtype=torch.bool).reshape(-1, 1)
+            if drop.shape[0] != fused.shape[0]:
+                raise ValueError("drop_mask must contain one value per batch item")
+            null = self.null_embedding.unsqueeze(0).expand_as(fused)
+            fused = torch.where(drop, null, fused)
+        return fused
+
+    def unconditional(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        return self.null_embedding.to(device).unsqueeze(0).expand(batch_size, -1)
+
+
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dimension: int) -> None:
         super().__init__()

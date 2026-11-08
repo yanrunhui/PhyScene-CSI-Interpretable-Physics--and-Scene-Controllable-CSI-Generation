@@ -281,6 +281,66 @@ def select_aod_candidates_within_tolerance(
     )
 
 
+def select_random_aod_candidates_within_tolerance(
+    payload: Mapping[str, torch.Tensor],
+    target_az_deg: float | torch.Tensor,
+    *,
+    samples: int,
+    tolerance_deg: float,
+    mode: AoDControlMode,
+    projector: AoDControlProjector,
+    generator: torch.Generator,
+    exclude_strongest_near_ties: bool = False,
+) -> AoDCandidateSelection:
+    """Uniformly sample unique links from the complete eligible candidate set.
+
+    Every naturally accepted candidate has the same inclusion probability.
+    This is deliberately different from choosing the smallest angular errors,
+    which would silently narrow the requested conditional distribution.
+    """
+    if samples < 1:
+        raise ValueError("samples must be positive")
+    if not 0.0 <= tolerance_deg <= 180.0:
+        raise ValueError("tolerance_deg must lie in [0, 180]")
+    measured = projector(payload, target_az_deg, mode=mode)
+    distance = measured.rotation_deg.abs()
+    eligible = measured.control_valid & (distance <= float(tolerance_deg))
+    if mode == "strongest" and exclude_strongest_near_ties:
+        eligible &= ~measured.strongest_near_tie
+    eligible_indices = torch.nonzero(eligible, as_tuple=False).flatten()
+    eligible_count = int(eligible_indices.numel())
+    if eligible_count < samples:
+        acceptance = eligible_count / max(int(distance.numel()), 1)
+        raise ValueError(
+            f"AoD candidate pool accepted {eligible_count}/{distance.numel()} "
+            f"unique links ({acceptance:.3%}) within ±{tolerance_deg:g}°, "
+            f"but {samples} were requested"
+        )
+    try:
+        order = torch.randperm(
+            eligible_count,
+            generator=generator,
+            device=eligible_indices.device,
+        )
+    except RuntimeError as error:
+        raise ValueError(
+            "selection generator and eligible candidate tensors must use the "
+            "same device type"
+        ) from error
+    indices = eligible_indices[order[:samples]]
+    if int(torch.unique(indices).numel()) != samples:
+        raise RuntimeError("random AoD selection produced a duplicate candidate")
+    return AoDCandidateSelection(
+        indices=indices,
+        angular_distance_deg=distance[indices],
+        eligible_mask=eligible,
+        pool_measurement=measured,
+        requested_samples=samples,
+        candidate_samples=int(distance.numel()),
+        eligible_samples=eligible_count,
+    )
+
+
 def select_payload_samples(
     payload: Mapping[str, torch.Tensor], indices: torch.Tensor
 ) -> dict[str, torch.Tensor]:

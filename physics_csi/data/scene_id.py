@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from physics_csi.data.dataset import PreparedShardDataset
 
@@ -77,6 +77,37 @@ class SceneIdDataset(Dataset):
             self.map_id_to_index[map_id], dtype=torch.int64
         )
         return result
+
+
+class LocalityAwareBlockShuffleSampler(Sampler[int]):
+    """Shuffle contiguous index blocks while keeping shard-local disk access."""
+
+    def __init__(self, dataset: Dataset, *, block_size: int, seed: int) -> None:
+        if block_size < 1:
+            raise ValueError("block_size must be positive")
+        self.length = len(dataset)
+        self.block_size = int(block_size)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def __len__(self) -> int:
+        return self.length
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        blocks = [
+            (start, min(start + self.block_size, self.length))
+            for start in range(0, self.length, self.block_size)
+        ]
+        block_order = torch.randperm(len(blocks), generator=generator).tolist()
+        for block_index in block_order:
+            start, end = blocks[block_index]
+            # Keep local order sequential so each worker reuses the currently
+            # loaded prepared shard instead of alternating between files.
+            yield from range(start, end)
 
 
 def _allocate_groups(
@@ -306,15 +337,25 @@ def make_scene_id_dataloaders(
     batch_size: int,
     num_workers: int,
     pin_memory: bool = True,
+    training_block_shuffle_size: int | None = None,
+    training_seed: int = 0,
 ) -> dict[str, DataLoader]:
-    return {
-        split: DataLoader(
+    loaders: dict[str, DataLoader] = {}
+    for split, dataset in datasets.items():
+        sampler = None
+        if split == "train" and training_block_shuffle_size is not None:
+            sampler = LocalityAwareBlockShuffleSampler(
+                dataset,
+                block_size=training_block_shuffle_size,
+                seed=training_seed,
+            )
+        loaders[split] = DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=split == "train",
+            shuffle=split == "train" and sampler is None,
+            sampler=sampler,
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=num_workers > 0,
         )
-        for split, dataset in datasets.items()
-    }
+    return loaders
