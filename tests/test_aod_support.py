@@ -4,6 +4,7 @@ import torch
 
 from physics_csi.evaluation.aod_support import (
     circular_distance_degrees,
+    conditioned_aod_measurement,
     local_support_counts,
     match_independent_supported_pairs,
 )
@@ -63,6 +64,23 @@ def test_support_and_independent_pairing() -> None:
     assert query.numel() == donor.numel() == 6
     assert not bool(torch.isin(query, donor).any())
     assert audit["pairs"] == 6
+
+
+def test_strongest_support_uses_final_power_path_and_excludes_near_ties() -> None:
+    payload = _payload(3)
+    payload["path_powers_linear"] = torch.tensor(
+        [[0.9, 0.1], [0.5, 0.5], [0.1, 0.9]]
+    )
+    payload["aod_az_deg"] = torch.tensor(
+        [[-40.0, 20.0], [-10.0, 70.0], [5.0, 80.0]]
+    )
+    angle, valid, gap = conditioned_aod_measurement(
+        payload, condition_type="strongest"
+    )
+    assert torch.allclose(angle[[0, 2]], torch.tensor([-40.0, 80.0]))
+    assert valid.tolist() == [True, False, True]
+    assert torch.isnan(angle[1])
+    assert float(gap[0]) > 0.5
 
 
 def test_empty_los_macro_returns_unavailable_selection() -> None:

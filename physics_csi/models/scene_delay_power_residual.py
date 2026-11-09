@@ -304,4 +304,19 @@ class SceneConditionedDelayPowerResidual(nn.Module):
         result["path_mask"] = _gather_paths(
             base["path_mask"].bool(), output.canonical_order
         )
+        tracked_anchor = base.get("strongest_anchor_path_index")
+        if (
+            isinstance(tracked_anchor, torch.Tensor)
+            and tracked_anchor.shape == (sample_count,)
+        ):
+            tracked_anchor = tracked_anchor.to(
+                device=output.canonical_order.device, dtype=torch.long
+            )
+            if bool(
+                ((tracked_anchor < 0) | (tracked_anchor >= self.max_paths)).any()
+            ):
+                raise ValueError("Strongest Anchor index is outside the path table")
+            result["strongest_anchor_path_index"] = (
+                output.canonical_order == tracked_anchor.unsqueeze(-1)
+            ).long().argmax(-1)
         return result

@@ -33,17 +33,64 @@ def _load_compatible_weights(
     model: MultipathDiffusionModel, checkpoint_path: str
 ) -> dict[str, Any]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    supported = {
+    five_condition_supported = {
         "multipath_diffusion",
         "multipath_diffusion_seen_map_baseline",
         "multipath_diffusion_scene_id",
         "multipath_diffusion_scene_id_spatial",
+    }
+    supported = five_condition_supported | {
         "multipath_diffusion_scene_residual",
         "multipath_diffusion_scene_residual_spatial",
         "multipath_diffusion_scene_id_aod_conditioned",
         "multipath_diffusion_aod_conditioned",
+        "multipath_diffusion_scene_id_strongest_aod_conditioned",
+        "multipath_diffusion_strongest_aod_conditioned",
     }
+    condition_type = str(model.aod_conditioning.get("condition_type", "mean"))
+    if condition_type == "strongest":
+        if model.strongest_anchor_enabled:
+            # The first run starts from the five-condition B3.  A later Anchor
+            # continuation may reuse an Anchor checkpoint, but an absolute-AoD
+            # Strongest checkpoint is intentionally excluded because its
+            # denoiser has a different output-coordinate contract.
+            supported = (
+                {
+                    "multipath_diffusion_scene_id",
+                    "multipath_diffusion_scene_id_spatial",
+                    "multipath_diffusion_scene_id_strongest_aod_anchor",
+                }
+                if model.scene_conditioning_enabled
+                else {
+                    "multipath_diffusion",
+                    "multipath_diffusion_seen_map_baseline",
+                    "multipath_diffusion_strongest_aod_anchor",
+                }
+            )
+        else:
+            # The first Strongest-AoD experiment starts from the original
+            # five-condition B3 rather than inherit a Mean-AoD fine-tune.
+            supported = (
+                {
+                    "multipath_diffusion_scene_id",
+                    "multipath_diffusion_scene_id_spatial",
+                }
+                if model.scene_conditioning_enabled
+                else {
+                    "multipath_diffusion",
+                    "multipath_diffusion_seen_map_baseline",
+                }
+            )
     if checkpoint.get("model_kind") not in supported:
+        if condition_type == "strongest":
+            expected = (
+                "an original five-condition B3/B3-S-ID or Strongest Anchor checkpoint"
+                if model.strongest_anchor_enabled
+                else "an original five-condition B3/B3-S-ID checkpoint"
+            )
+            raise ValueError(
+                f"Strongest-AoD fine-tuning must initialize from {expected}"
+            )
         raise ValueError("--initialize-from points to an unsupported checkpoint")
     source = checkpoint.get("ema_state_dict", checkpoint["model_state_dict"])
     target = model.state_dict()
@@ -65,6 +112,19 @@ def _load_compatible_weights(
 
 def _model_kind(model: MultipathDiffusionModel) -> str:
     if model.aod_conditioning_enabled:
+        condition_type = str(model.aod_conditioning.get("condition_type", "mean"))
+        if condition_type == "strongest":
+            if model.strongest_anchor_enabled:
+                return (
+                    "multipath_diffusion_scene_id_strongest_aod_anchor"
+                    if model.scene_conditioning_enabled
+                    else "multipath_diffusion_strongest_aod_anchor"
+                )
+            return (
+                "multipath_diffusion_scene_id_strongest_aod_conditioned"
+                if model.scene_conditioning_enabled
+                else "multipath_diffusion_strongest_aod_conditioned"
+            )
         return (
             "multipath_diffusion_scene_id_aod_conditioned"
             if model.scene_conditioning_enabled
@@ -129,6 +189,15 @@ def main() -> None:
             "but start a new optimizer and history."
         ),
     )
+    parser.add_argument(
+        "--epochs", type=int, default=None, help="Override epochs for a new run."
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=None,
+        help="Override learning rate for a new run.",
+    )
     args = parser.parse_args()
     initialize_from = args.initialize_from or args.initialize_from_b3
     if args.initialize_from and args.initialize_from_b3:
@@ -137,6 +206,8 @@ def main() -> None:
         raise ValueError("--resume and --initialize-from are mutually exclusive")
     if args.resume and args.seed is not None:
         raise ValueError("--seed cannot be changed while resuming a checkpoint")
+    if args.resume and (args.epochs is not None or args.learning_rate is not None):
+        raise ValueError("epochs and learning rate are restored when resuming")
     resume_checkpoint = (
         torch.load(args.resume, map_location="cpu", weights_only=False)
         if args.resume
@@ -177,6 +248,14 @@ def main() -> None:
             raise ValueError("checkpoint has no embedded scene-ID experiment plan")
     if args.checkpoint_dir:
         config["train"]["checkpoint_dir"] = args.checkpoint_dir
+    if args.epochs is not None:
+        if args.epochs <= 0:
+            raise ValueError("epochs must be positive")
+        config["train"]["epochs"] = args.epochs
+    if args.learning_rate is not None:
+        if args.learning_rate <= 0.0:
+            raise ValueError("learning rate must be positive")
+        config["train"]["learning_rate"] = args.learning_rate
     if args.seed is not None:
         config["train"]["seed"] = args.seed
     train = config["train"]
@@ -184,9 +263,24 @@ def main() -> None:
     prepared_root = config["data"]["prepared_root"]
     datasets = make_scene_id_datasets(prepared_root, plan)
     aod_data_config = dict(config.get("aod_conditioned_data", {}))
-    if bool(config["multipath_diffusion"].get("aod_conditioning", {}).get("enabled", False)):
+    aod_model_config = dict(
+        config["multipath_diffusion"].get("aod_conditioning", {})
+    )
+    if bool(aod_model_config.get("enabled", False)):
+        model_condition_type = str(aod_model_config.get("condition_type", "mean"))
+        data_condition_type = str(
+            aod_data_config.get("condition_type", model_condition_type)
+        )
+        if data_condition_type != model_condition_type:
+            raise ValueError(
+                "aod_conditioned_data.condition_type must match "
+                "multipath_diffusion.aod_conditioning.condition_type"
+            )
+        aod_data_config["condition_type"] = data_condition_type
+        config["aod_conditioned_data"] = aod_data_config
         datasets = make_aod_conditioned_datasets(
             datasets,
+            condition_type=data_condition_type,
             path_count=(
                 int(aod_data_config["path_count"])
                 if aod_data_config.get("path_count") is not None

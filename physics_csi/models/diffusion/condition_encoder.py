@@ -67,7 +67,7 @@ class ConditionEncoder(nn.Module):
 
 
 class CircularAoDConditionFusion(nn.Module):
-    """Fuse a continuous circular Mean-AoD target into a physical embedding."""
+    """Fuse a continuous circular Mean- or Strongest-AoD target."""
 
     def __init__(
         self, embedding_dim: int, hidden_dim: int, dropout: float = 0.0
@@ -88,19 +88,19 @@ class CircularAoDConditionFusion(nn.Module):
     def forward(
         self,
         physical_embedding: torch.Tensor,
-        mean_aod_az_deg: torch.Tensor,
+        aod_az_deg: torch.Tensor,
         validity: torch.Tensor,
         *,
         drop_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if physical_embedding.ndim != 2:
             raise ValueError("physical embedding must have shape [batch, dimension]")
-        angle = mean_aod_az_deg.to(
+        angle = aod_az_deg.to(
             device=physical_embedding.device, dtype=physical_embedding.dtype
         ).reshape(-1)
         valid = validity.to(device=physical_embedding.device, dtype=torch.bool).reshape(-1)
         if angle.shape[0] != physical_embedding.shape[0] or valid.shape != angle.shape:
-            raise ValueError("Mean-AoD condition must contain one value per batch item")
+            raise ValueError("AoD condition must contain one value per batch item")
         radians = torch.deg2rad(angle)
         circular = torch.stack([radians.sin(), radians.cos()], dim=-1)
         circular = torch.where(valid.unsqueeze(-1), circular, torch.zeros_like(circular))

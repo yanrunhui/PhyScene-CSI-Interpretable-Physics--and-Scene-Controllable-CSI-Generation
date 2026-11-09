@@ -5,7 +5,7 @@ from typing import Literal, Mapping
 
 import torch
 
-from physics_csi.evaluation.aod_support import mean_aod
+from physics_csi.evaluation.aod_support import mean_aod, strongest_aod
 from physics_csi.evaluation.distribution import full_multipath_features
 from physics_csi.physics.aod_control import wrap_degrees
 
@@ -70,6 +70,7 @@ def multipath_view_features(
     *,
     view: FeatureView,
     target_mean_aod_deg: torch.Tensor | None = None,
+    condition_type: Literal["mean", "strongest"] = "mean",
 ) -> torch.Tensor:
     """Build link-level multipath features for a recall interpretation view."""
     if view not in {
@@ -82,15 +83,20 @@ def multipath_view_features(
     working = dict(payload)
     if view == "target_centered":
         if target_mean_aod_deg is None:
-            raise ValueError("target_centered features require target Mean AoD")
+            raise ValueError("target_centered features require a target AoD")
         center = target_mean_aod_deg.to(payload["aod_az_deg"]).reshape(-1)
         if center.shape != (payload["aod_az_deg"].shape[0],):
-            raise ValueError("target Mean AoD must have shape [samples]")
+            raise ValueError("target AoD must have shape [samples]")
         working["aod_az_deg"] = wrap_degrees(
             payload["aod_az_deg"].float() - center.unsqueeze(-1)
         )
     elif view == "self_centered":
-        center, _ = mean_aod(payload)
+        if condition_type == "mean":
+            center, _ = mean_aod(payload)
+        elif condition_type == "strongest":
+            center = strongest_aod(payload).angle_deg
+        else:
+            raise ValueError(f"unsupported AoD condition type: {condition_type}")
         working["aod_az_deg"] = wrap_degrees(
             payload["aod_az_deg"].float() - center.unsqueeze(-1)
         )

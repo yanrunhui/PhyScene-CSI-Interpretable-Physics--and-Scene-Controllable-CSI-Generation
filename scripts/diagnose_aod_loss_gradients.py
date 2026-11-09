@@ -108,23 +108,28 @@ def _mean_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         key: sum(float(record[key]) for record in records) / len(records)
         for key in scalar_keys
     }
-    group_names = sorted(records[0]["gradient_groups"])
-    result["gradient_groups"] = {}
-    for group in group_names:
-        keys = sorted(records[0]["gradient_groups"][group])
-        result["gradient_groups"][group] = {
-            key: sum(
-                float(record["gradient_groups"][group][key]) for record in records
-            )
-            / len(records)
-            for key in keys
-        }
+    nested_fields = sorted(
+        key
+        for key, value in records[0].items()
+        if isinstance(value, dict) and key.endswith("gradient_groups")
+    )
+    for field in nested_fields:
+        result[field] = {}
+        for group in sorted(records[0][field]):
+            keys = sorted(records[0][field][group])
+            result[field][group] = {
+                key: sum(
+                    float(record[field][group][key]) for record in records
+                )
+                / len(records)
+                for key in keys
+            }
     return result
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Measure independent diffusion and weighted Mean-AoD gradients."
+        description="Measure diffusion and AoD-condition gradient norms independently."
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", required=True)
@@ -140,15 +145,25 @@ def main() -> None:
     seed_everything(args.seed)
     device = resolve_device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    if checkpoint.get("model_kind") != "multipath_diffusion_scene_id_aod_conditioned":
+    if checkpoint.get("model_kind") not in {
+        "multipath_diffusion_scene_id_aod_conditioned",
+        "multipath_diffusion_scene_id_strongest_aod_conditioned",
+        "multipath_diffusion_scene_id_strongest_aod_anchor",
+    }:
         raise ValueError("checkpoint is not an AoD-conditioned scene-ID diffusion model")
     config = checkpoint["config"]
     plan = config.get("scene_id_experiment")
     if plan is None:
         raise ValueError("checkpoint has no embedded scene split")
     data_config = dict(config.get("aod_conditioned_data", {}))
+    condition_type = str(
+        config["multipath_diffusion"]
+        .get("aod_conditioning", {})
+        .get("condition_type", "mean")
+    )
     datasets = make_aod_conditioned_datasets(
         make_scene_id_datasets(config["data"]["prepared_root"], plan),
+        condition_type=condition_type,
         path_count=(
             int(data_config["path_count"])
             if data_config.get("path_count") is not None
@@ -202,26 +217,29 @@ def main() -> None:
         diffusion_gradients = _gradient_pair(
             metrics["diffusion_loss"], parameters, retain_graph=True
         )
-        aod_gradients = _gradient_pair(weighted_aod, parameters, retain_graph=False)
+        aod_gradients = _gradient_pair(
+            weighted_aod,
+            parameters,
+            retain_graph=False,
+        )
         gradient_groups = _gradient_statistics(
             names, diffusion_gradients, aod_gradients
         )
-        records.append(
-            {
-                "batch": batch_number,
-                "samples": int(batch["conditions"].shape[0]),
-                "diffusion_loss": float(metrics["diffusion_loss"].detach()),
-                "aod_loss_unweighted": float(metrics["aod_condition_loss"].detach()),
-                "aod_loss_weighted": float(weighted_aod.detach()),
-                "aod_error_deg_low_noise": float(
-                    metrics["aod_condition_error_deg"].detach()
-                ),
-                "aod_supervision_fraction": float(
-                    metrics["aod_condition_supervision_fraction"].detach()
-                ),
-                "gradient_groups": gradient_groups,
-            }
-        )
+        record: dict[str, Any] = {
+            "batch": batch_number,
+            "samples": int(batch["conditions"].shape[0]),
+            "diffusion_loss": float(metrics["diffusion_loss"].detach()),
+            "aod_loss_unweighted": float(metrics["aod_condition_loss"].detach()),
+            "aod_loss_weighted": float(weighted_aod.detach()),
+            "aod_error_deg_low_noise": float(
+                metrics["aod_condition_error_deg"].detach()
+            ),
+            "aod_supervision_fraction": float(
+                metrics["aod_condition_supervision_fraction"].detach()
+            ),
+            "gradient_groups": gradient_groups,
+        }
+        records.append(record)
     if not records:
         raise RuntimeError("no batch contained an active low-noise AoD supervision sample")
 
@@ -233,6 +251,7 @@ def main() -> None:
         "diagnostic": "aod_conditioned_loss_gradient_audit",
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "weights": args.weights,
+        "condition_type": condition_type,
         "seed": args.seed,
         "requested_batches": args.batches,
         "evaluated_batches": len(records),

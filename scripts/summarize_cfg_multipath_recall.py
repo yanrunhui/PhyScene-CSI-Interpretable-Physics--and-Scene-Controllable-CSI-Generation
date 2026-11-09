@@ -38,6 +38,7 @@ def main() -> None:
     summary = {
         "format_version": 1,
         "diagnostic": "cfg2_cfg3_multipath_recall_decision_summary",
+        "condition_type": report.get("condition_type", "mean"),
         "samples": report["samples"],
         "maps": report["maps"],
         "decision": report["decision"],

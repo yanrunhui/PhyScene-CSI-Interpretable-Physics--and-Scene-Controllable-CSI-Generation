@@ -16,8 +16,8 @@ if str(ROOT) not in sys.path:
 
 from physics_csi.data.delay_power_residual import DelayPowerResidualCacheDataset
 from physics_csi.evaluation.aod_support import (
+    conditioned_aod_measurement,
     match_independent_supported_pairs,
-    mean_aod,
 )
 from physics_csi.utils.io import atomic_json_dump
 
@@ -35,7 +35,7 @@ def _quantiles(values: torch.Tensor) -> dict[str, float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Audit joint Map, physical-condition and Mean-AoD support in RayVerse."
+        description="Audit joint Map, physical-condition and controlled-AoD support in RayVerse."
     )
     parser.add_argument("--cache", required=True)
     parser.add_argument("--split", choices=["validation", "test"], required=True)
@@ -47,6 +47,9 @@ def main() -> None:
     parser.add_argument("--minimum-support", type=int, default=8)
     parser.add_argument("--maximum-pairs-per-map-los", type=int, default=32)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--condition-type", choices=["mean", "strongest"], default="mean"
+    )
     args = parser.parse_args()
     if args.path_count < 1:
         raise ValueError("path-count must be positive")
@@ -71,8 +74,11 @@ def main() -> None:
         path_count=args.path_count,
         maximum_pairs_per_map_los=args.maximum_pairs_per_map_los,
         seed=args.seed,
+        condition_type=args.condition_type,
     )
-    angle, concentration = mean_aod(reference)
+    angle, valid_angle, confidence = conditioned_aod_measurement(
+        reference, condition_type=args.condition_type
+    )
     path_count = reference["path_mask"].bool().sum(-1)
     los = reference["conditions"][:, 3] >= 0.5
     map_ids = reference["map_id"].long()
@@ -93,13 +99,20 @@ def main() -> None:
                         Counter(path_count[selected].tolist()).items()
                     )
                 },
-                "mean_aod_histogram_30deg": {
+                "controlled_aod_histogram_30deg": {
                     f"[{lower},{lower + 30})": int(
-                        (angle_bin[selected] == number).sum()
+                        ((angle_bin == number) & selected & valid_angle).sum()
                     )
                     for number, lower in enumerate(range(-180, 180, 30))
                 },
-                "mean_aod_concentration": _quantiles(concentration[selected]),
+                "controlled_aod_valid_rate": float(valid_angle[selected].float().mean()),
+                "controlled_aod_confidence": _quantiles(
+                    confidence[selected & valid_angle & torch.isfinite(confidence)]
+                )
+                if bool(
+                    (selected & valid_angle & torch.isfinite(confidence)).any()
+                )
+                else {},
             }
         distributions[f"map_{map_id}"] = map_section
 
@@ -123,6 +136,7 @@ def main() -> None:
     report = {
         "format_version": 1,
         "diagnostic": "map_condition_aod_joint_support",
+        "condition_type": args.condition_type,
         "cache": str(Path(args.cache).resolve()),
         "split": args.split,
         "samples": len(dataset),
@@ -132,6 +146,10 @@ def main() -> None:
             "maximum_circular_angle_distance_deg": args.maximum_angle_distance_deg,
             "minimum_real_neighbors": args.minimum_support,
             "maximum_pairs_per_map_los": args.maximum_pairs_per_map_los,
+            "condition_type": args.condition_type,
+            "strongest_near_tie_exclusion_gap_db": (
+                0.5 if args.condition_type == "strongest" else None
+            ),
             "exact_matching": ["Map", "LoS", "K-factor validity", "Path Count"],
         },
         "support_summary_for_selected_path_count": {
@@ -151,7 +169,7 @@ def main() -> None:
         "interpretation": {
             "support_count": (
                 "Number of other real links with the same Map/LoS/K-validity/L, "
-                "nearby normalized Power-DS-K and nearby circular Mean AoD."
+                "nearby normalized Power-DS-K and nearby circular controlled AoD."
             ),
             "independence": (
                 "Query conditions and real donors come from disjoint random halves; "
@@ -162,6 +180,7 @@ def main() -> None:
     plan = {
         "format_version": 1,
         "kind": "map_condition_aod_supported_pair_plan",
+        "condition_type": args.condition_type,
         "split": args.split,
         "cache": str(Path(args.cache).resolve()),
         "cache_scene_plan_fingerprint": cache.get("scene_plan_fingerprint"),

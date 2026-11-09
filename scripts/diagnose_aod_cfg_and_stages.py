@@ -18,9 +18,13 @@ if str(ROOT) not in sys.path:
 from physics_csi.data.aod_conditioned import (
     AoDConditionedDataset,
     make_aod_conditioned_datasets,
-    power_weighted_mean_aod,
 )
 from physics_csi.data.scene_id import make_scene_id_datasets
+from physics_csi.evaluation.aod_support import (
+    circular_distance_degrees,
+    conditioned_aod_measurement,
+    strongest_aod,
+)
 from physics_csi.models.diffusion.multipath_diffusion import MultipathDiffusionModel
 from physics_csi.models.scene_delay_power_residual import (
     SceneConditionedDelayPowerResidual,
@@ -107,11 +111,13 @@ def _stage_metrics(
     target_conditions: torch.Tensor,
     target_validity: torch.Tensor,
     synthesizer: MIMOOFDMSynthesizer,
+    condition_type: str,
 ) -> dict[str, Any]:
-    actual, concentration = power_weighted_mean_aod(
-        payload["path_powers_linear"], payload["aod_az_deg"], payload["path_mask"]
+    actual, valid_aod, confidence = conditioned_aod_measurement(
+        payload, condition_type=condition_type
     )
     error = _circular_error(actual, target)
+    valid_error = error[valid_aod]
     mask = payload["path_mask"].bool()
     power = payload["path_powers_linear"].float().clamp_min(0.0) * mask
     weights = power / power.sum(-1, keepdim=True).clamp_min(1e-20)
@@ -142,18 +148,160 @@ def _stage_metrics(
             selected = target_validity[:, index].bool()
             if bool(selected.any()):
                 condition_error[name] = float(difference[selected, index].mean())
-    return {
+    result: dict[str, Any] = {
         "samples": int(error.numel()),
-        "mean_aod_error_deg": _quantiles(error),
-        "hit_at_5deg": float((error <= 5.0).float().mean()),
-        "hit_at_10deg": float((error <= 10.0).float().mean()),
-        "mean_aod_concentration": _quantiles(concentration),
+        "valid_aod_samples": int(valid_error.numel()),
+        "aod_valid_rate": float(valid_aod.float().mean()),
+        "aod_error_deg": _quantiles(valid_error),
+        "hit_at_5deg": float((valid_error <= 5.0).float().mean()),
+        "hit_at_10deg": float((valid_error <= 10.0).float().mean()),
+        "aod_confidence": _quantiles(confidence[valid_aod & torch.isfinite(confidence)]),
         "within_link_relative_aod_spread_deg": _quantiles(within_link_spread),
         "normalized_csi_rms_dispersion": float(csi_dispersion),
         "constraint_feasible_rate": (
             float(feasible.float().mean()) if feasible is not None else None
         ),
         "mean_absolute_physical_condition_error": condition_error,
+    }
+    result[f"{condition_type}_aod_error_deg"] = result["aod_error_deg"]
+    if condition_type == "mean":
+        result["mean_aod_concentration"] = result["aod_confidence"]
+    else:
+        strongest = strongest_aod(payload)
+        path_error = circular_distance_degrees(
+            payload["aod_az_deg"].float(), target.unsqueeze(-1)
+        ).masked_fill(~mask, torch.inf)
+        nearest_index = path_error.argmin(-1)
+        nearest_error = path_error.gather(1, nearest_index.unsqueeze(-1)).squeeze(-1)
+        nearest_power = power.gather(1, nearest_index.unsqueeze(-1)).squeeze(-1)
+        nearest_rank = 1 + (
+            power > nearest_power.unsqueeze(-1)
+        ).sum(-1)
+        result.update(
+            strongest_top2_power_gap_db=_quantiles(
+                strongest.top2_power_gap_db[
+                    strongest.valid & torch.isfinite(strongest.top2_power_gap_db)
+                ]
+            ),
+            strongest_near_tie_rate=float(strongest.near_tie.float().mean()),
+            target_nearest_path_error_deg=_quantiles(nearest_error),
+            target_nearest_path_power_rank_mean=float(nearest_rank.float().mean()),
+            target_nearest_path_is_strongest_rate=float(
+                (nearest_rank == 1).float().mean()
+            ),
+            target_nearest_path_rank_histogram={
+                str(rank): int((nearest_rank == rank).sum())
+                for rank in range(1, int(mask.shape[1]) + 1)
+            },
+        )
+    return result
+
+
+def _power_rank(
+    powers: torch.Tensor, mask: torch.Tensor, index: torch.Tensor
+) -> torch.Tensor:
+    masked = powers.float().masked_fill(~mask.bool(), -torch.inf)
+    selected = masked.gather(1, index.unsqueeze(-1)).squeeze(-1)
+    return 1 + (masked > selected.unsqueeze(-1)).sum(-1)
+
+
+def _strongest_stage_transition(
+    before: Mapping[str, torch.Tensor],
+    after: Mapping[str, torch.Tensor],
+    target: torch.Tensor,
+) -> dict[str, Any]:
+    before_measurement = strongest_aod(before)
+    after_measurement = strongest_aod(after)
+    valid = before_measurement.valid & after_measurement.valid
+    mask = before["path_mask"].bool() & after["path_mask"].bool()
+    target_error = circular_distance_degrees(
+        before["aod_az_deg"].float(), target.unsqueeze(-1)
+    ).masked_fill(~mask, torch.inf)
+    target_nearest = target_error.argmin(-1)
+    before_power = before["path_powers_linear"].float().clamp_min(1e-20)
+    after_power = after["path_powers_linear"].float().clamp_min(1e-20)
+    before_rank = _power_rank(before_power, mask, target_nearest)
+    after_rank = _power_rank(after_power, mask, target_nearest)
+    target_power_delta_db = 10.0 * torch.log10(
+        after_power.gather(1, target_nearest.unsqueeze(-1)).squeeze(-1)
+        / before_power.gather(1, target_nearest.unsqueeze(-1)).squeeze(-1)
+    )
+    before_top_power_delta_db = 10.0 * torch.log10(
+        after_power.gather(
+            1, before_measurement.path_index.unsqueeze(-1)
+        ).squeeze(-1)
+        / before_power.gather(
+            1, before_measurement.path_index.unsqueeze(-1)
+        ).squeeze(-1)
+    )
+    result: dict[str, Any] = {
+        "samples": int(valid.sum()),
+        "strongest_path_switch_rate": float(
+            (
+                before_measurement.path_index[valid]
+                != after_measurement.path_index[valid]
+            )
+            .float()
+            .mean()
+        ),
+        "target_nearest_path_rank_before_mean": float(before_rank.float().mean()),
+        "target_nearest_path_rank_after_mean": float(after_rank.float().mean()),
+        "target_nearest_path_rank_worsened_rate": float(
+            (after_rank > before_rank).float().mean()
+        ),
+        "target_nearest_path_rank_improved_rate": float(
+            (after_rank < before_rank).float().mean()
+        ),
+        "target_nearest_path_is_strongest_before_rate": float(
+            (before_rank == 1).float().mean()
+        ),
+        "target_nearest_path_is_strongest_after_rate": float(
+            (after_rank == 1).float().mean()
+        ),
+        "target_nearest_path_power_delta_db": _quantiles(target_power_delta_db),
+        "pre_dp_strongest_path_power_delta_db": _quantiles(
+            before_top_power_delta_db
+        ),
+    }
+    return result
+
+
+def _combine_strongest_transitions(
+    transitions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not transitions:
+        return {}
+    total = sum(int(item["samples"]) for item in transitions)
+
+    def weighted(key: str) -> float:
+        return sum(
+            int(item["samples"]) * float(item[key]) for item in transitions
+        ) / max(total, 1)
+
+    scalar_fields = (
+        "strongest_path_switch_rate",
+        "target_nearest_path_rank_before_mean",
+        "target_nearest_path_rank_after_mean",
+        "target_nearest_path_rank_worsened_rate",
+        "target_nearest_path_rank_improved_rate",
+        "target_nearest_path_is_strongest_before_rate",
+        "target_nearest_path_is_strongest_after_rate",
+    )
+    return {
+        "samples": total,
+        **{field: weighted(field) for field in scalar_fields},
+        "target_nearest_path_power_delta_db_mean": sum(
+            int(item["samples"])
+            * float(item["target_nearest_path_power_delta_db"]["mean"])
+            for item in transitions
+        )
+        / max(total, 1),
+        "pre_dp_strongest_path_power_delta_db_mean": sum(
+            int(item["samples"])
+            * float(item["pre_dp_strongest_path_power_delta_db"]["mean"])
+            for item in transitions
+        )
+        / max(total, 1),
     }
 
 
@@ -178,16 +326,17 @@ def _combine_stage_metrics(cells: list[dict[str, Any]]) -> dict[str, Any]:
             for name in cell["mean_absolute_physical_condition_error"]
         }
     )
-    return {
+    result: dict[str, Any] = {
         "samples": total,
-        "mean_aod_error_deg": {
-            "mean": weighted(("mean_aod_error_deg", "mean")),
-            "p50_cell_weighted": weighted(("mean_aod_error_deg", "p50")),
-            "p95_cell_weighted": weighted(("mean_aod_error_deg", "p95")),
+        "aod_error_deg": {
+            "mean": weighted(("aod_error_deg", "mean")),
+            "p50_cell_weighted": weighted(("aod_error_deg", "p50")),
+            "p95_cell_weighted": weighted(("aod_error_deg", "p95")),
         },
+        "aod_valid_rate": weighted(("aod_valid_rate",)),
         "hit_at_5deg": weighted(("hit_at_5deg",)),
         "hit_at_10deg": weighted(("hit_at_10deg",)),
-        "mean_aod_concentration": weighted(("mean_aod_concentration", "mean")),
+        "aod_confidence": weighted(("aod_confidence", "mean")),
         "within_link_relative_aod_spread_deg": weighted(
             ("within_link_relative_aod_spread_deg", "mean")
         ),
@@ -217,6 +366,15 @@ def _combine_stage_metrics(cells: list[dict[str, Any]]) -> dict[str, Any]:
             for name in physical_names
         },
     }
+    strongest_fields = (
+        "strongest_near_tie_rate",
+        "target_nearest_path_power_rank_mean",
+        "target_nearest_path_is_strongest_rate",
+    )
+    for field in strongest_fields:
+        if all(field in cell for cell in cells):
+            result[field] = weighted((field,))
+    return result
 
 
 def _condition_batch(
@@ -243,7 +401,7 @@ def _condition_batch(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Scan CFG and trace Mean-AoD control across B3, DP and Link-global."
+        description="Scan CFG and trace controlled AoD across B3 and residual stages."
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", required=True)
@@ -278,7 +436,20 @@ def main() -> None:
     seed_everything(args.seed)
     device = resolve_device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    if checkpoint.get("model_kind") != "multipath_diffusion_scene_id_aod_conditioned":
+    model_kind = checkpoint.get("model_kind")
+    condition_type = (
+        "strongest"
+        if model_kind in {
+            "multipath_diffusion_scene_id_strongest_aod_conditioned",
+            "multipath_diffusion_scene_id_strongest_aod_anchor",
+        }
+        else "mean"
+    )
+    if model_kind not in {
+        "multipath_diffusion_scene_id_aod_conditioned",
+        "multipath_diffusion_scene_id_strongest_aod_conditioned",
+        "multipath_diffusion_scene_id_strongest_aod_anchor",
+    }:
         raise ValueError("checkpoint is not an AoD-conditioned scene-ID diffusion model")
     config = checkpoint["config"]
     plan = config.get("scene_id_experiment")
@@ -305,6 +476,7 @@ def main() -> None:
         ),
         minimum_concentration=float(data_config.get("minimum_concentration", 0.10)),
         reject_low_concentration=bool(data_config.get("reject_low_concentration", True)),
+        condition_type=condition_type,
     )
     test_dataset = datasets["test"]
     pool: dict[tuple[int, int], list[int]] = defaultdict(list)
@@ -387,6 +559,11 @@ def main() -> None:
                         generator = torch.Generator(device=device).manual_seed(
                             generation_seed
                         )
+                        aod_arguments = (
+                            {"strongest_aod_az_deg": target}
+                            if condition_type == "strongest"
+                            else {"mean_aod_az_deg": target}
+                        )
                         base = model.generate(
                             conditions,
                             args.samples_per_cell,
@@ -400,8 +577,8 @@ def main() -> None:
                                 sampling.get("path_count_temperature", 1.0)
                             ),
                             forced_path_count=trained_path_count,
-                            mean_aod_az_deg=target,
                             generator=generator,
+                            **aod_arguments,
                         )
                         stages: dict[str, Mapping[str, torch.Tensor]] = {
                             "aod_conditioned_b3": base
@@ -428,7 +605,8 @@ def main() -> None:
                         cell = {
                             "map_id": map_id,
                             "los_status": los_status,
-                            "target_mean_aod_deg": target_angle,
+                            "target_aod_deg": target_angle,
+                            "condition_type": condition_type,
                             "guidance_scale": guidance_scale,
                             "status": "ok",
                             "samples": args.samples_per_cell,
@@ -441,26 +619,36 @@ def main() -> None:
                                     conditions,
                                     validity,
                                     synthesizer,
+                                    condition_type,
                                 )
                                 for name, payload in stages.items()
                             },
                         }
+                        cell[f"target_{condition_type}_aod_deg"] = target_angle
                         if "b3_plus_dp" in cell["stages"]:
-                            cell["dp_mean_aod_error_change_deg"] = (
-                                cell["stages"]["b3_plus_dp"]["mean_aod_error_deg"][
+                            cell["dp_aod_error_change_deg"] = (
+                                cell["stages"]["b3_plus_dp"]["aod_error_deg"][
                                     "mean"
                                 ]
                                 - cell["stages"]["aod_conditioned_b3"][
-                                    "mean_aod_error_deg"
+                                    "aod_error_deg"
                                 ]["mean"]
                             )
+                            if condition_type == "strongest":
+                                cell["b3_to_dp_strongest_transition"] = (
+                                    _strongest_stage_transition(
+                                        stages["aod_conditioned_b3"],
+                                        stages["b3_plus_dp"],
+                                        target,
+                                    )
+                                )
                         if "b3_plus_dp_plus_link_global" in cell["stages"]:
-                            cell["link_mean_aod_error_change_deg"] = (
+                            cell["link_aod_error_change_deg"] = (
                                 cell["stages"]["b3_plus_dp_plus_link_global"][
-                                    "mean_aod_error_deg"
+                                    "aod_error_deg"
                                 ]["mean"]
                                 - cell["stages"]["b3_plus_dp"][
-                                    "mean_aod_error_deg"
+                                    "aod_error_deg"
                                 ]["mean"]
                             )
                         cells.append(cell)
@@ -472,9 +660,9 @@ def main() -> None:
                                     "los_status": los_status,
                                     "target_angle": target_angle,
                                     "guidance_scale": guidance_scale,
-                                    "base_mean_error_deg": cell["stages"][
+                                    "base_aod_error_deg": cell["stages"][
                                         "aod_conditioned_b3"
-                                    ]["mean_aod_error_deg"]["mean"],
+                                    ]["aod_error_deg"]["mean"],
                                 },
                                 sort_keys=True,
                             ),
@@ -489,7 +677,7 @@ def main() -> None:
             for cell in valid_cells
             if float(cell["guidance_scale"]) == guidance_scale
         ]
-        summaries[str(guidance_scale)] = {
+        scale_summary: dict[str, Any] = {
             "all": {
                 stage: _combine_stage_metrics(
                     [cell["stages"][stage] for cell in selected]
@@ -510,10 +698,28 @@ def main() -> None:
                 for los_status in args.los_statuses
             },
         }
+        if condition_type == "strongest" and dp_model is not None:
+            scale_summary["b3_to_dp_strongest_transition"] = (
+                _combine_strongest_transitions(
+                    [cell["b3_to_dp_strongest_transition"] for cell in selected]
+                )
+            )
+            for los_status in args.los_statuses:
+                scale_summary["by_los"][str(los_status)][
+                    "b3_to_dp_strongest_transition"
+                ] = _combine_strongest_transitions(
+                    [
+                        cell["b3_to_dp_strongest_transition"]
+                        for cell in selected
+                        if int(cell["los_status"]) == los_status
+                    ]
+                )
+        summaries[str(guidance_scale)] = scale_summary
 
     report = {
         "format_version": 1,
         "diagnostic": "aod_conditioned_cfg_and_residual_stage_audit",
+        "condition_type": condition_type,
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "dp_checkpoint": (
             str(Path(args.dp_checkpoint).resolve()) if args.dp_checkpoint else None
@@ -544,7 +750,7 @@ def main() -> None:
                 "K-factor/validity",
                 "LoS",
                 "Map ID",
-                "Mean AoD",
+                f"{condition_type} AoD",
             ],
             "pure_aod_cfg_supported_by_current_training": False,
             "interpretation_warning": (
@@ -559,8 +765,9 @@ def main() -> None:
                 "The DP sample after the frozen Link-global residual rotates AoD."
             ),
             "important": (
-                "DP can change Mean AoD without changing angle values because Mean AoD is "
-                "power weighted. Link-global changes AoD explicitly."
+                "DP can change controlled AoD without changing angle values because it "
+                "changes path powers; for Strongest AoD this may switch the argmax path. "
+                "Link-global changes AoD explicitly."
             ),
         },
         "summaries_by_guidance_scale": summaries,

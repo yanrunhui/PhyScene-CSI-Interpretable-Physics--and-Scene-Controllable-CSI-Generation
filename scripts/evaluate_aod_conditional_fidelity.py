@@ -14,7 +14,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from physics_csi.evaluation.aod_support import circular_distance_degrees, mean_aod
+from physics_csi.evaluation.aod_support import (
+    circular_distance_degrees,
+    conditioned_aod_measurement,
+    strongest_aod,
+)
 from physics_csi.evaluation.scene_diagnostics import paired_map_summary
 from physics_csi.training.trainer import resolve_device
 from physics_csi.utils.io import atomic_json_dump
@@ -26,7 +30,7 @@ from scripts.evaluate_csi_absolute_quality import (
 )
 
 
-CANDIDATE_LABELS = (
+MEAN_CANDIDATE_LABELS = (
     "aod_cfg1_dp",
     "aod_cfg2_dp",
     "aod_cfg3_dp",
@@ -35,7 +39,7 @@ CANDIDATE_LABELS = (
 )
 BASELINE_LABEL = "baseline_b3_dp_link"
 FIDELITY_SELECTION_WEIGHTS = {
-    "mean_aod_error_deg": 0.30,
+    "aod_error_deg": 0.30,
     "path_level_power_aod_sliced_wasserstein": 0.15,
     "link_level_power_aod_sliced_wasserstein": 0.15,
     "power_weighted_aod_sliced_wasserstein": 0.10,
@@ -58,15 +62,22 @@ def _control_metrics(
     target_angle: torch.Tensor,
     support_count: torch.Tensor | None,
     minimum_support: int,
+    condition_type: str,
 ) -> dict[str, Any]:
-    actual, _ = mean_aod(payload)
+    actual, valid, confidence = conditioned_aod_measurement(
+        payload, condition_type=condition_type
+    )
     error = circular_distance_degrees(actual, target_angle)
+    error = error[valid]
+    if not error.numel():
+        raise ValueError("controlled AoD measurement has no valid samples")
     result: dict[str, Any] = {
         "samples": int(error.numel()),
-        "mean_aod_error_deg": float(error.mean()),
+        "aod_error_deg": float(error.mean()),
         "p95_aod_error_deg": float(torch.quantile(error, 0.95)),
         "hit_at_5deg": float((error <= 5.0).float().mean()),
         "hit_at_10deg": float((error <= 10.0).float().mean()),
+        "controlled_aod_valid_rate": float(valid.float().mean()),
         "path_count_accuracy": float(
             (
                 payload["path_mask"].bool().sum(-1)
@@ -76,6 +87,78 @@ def _control_metrics(
             .mean()
         ),
     }
+    result[f"{condition_type}_aod_error_deg"] = result["aod_error_deg"]
+    if condition_type == "strongest":
+        measurement = strongest_aod(payload)
+        finite_gap = measurement.top2_power_gap_db[
+            measurement.valid & torch.isfinite(measurement.top2_power_gap_db)
+        ]
+        path_mask = payload["path_mask"].bool()
+        per_path_error = circular_distance_degrees(
+            payload["aod_az_deg"].float(), target_angle.float().unsqueeze(-1)
+        ).masked_fill(~path_mask, torch.inf)
+        target_nearest_index = per_path_error.argmin(-1)
+        target_nearest_power = payload["path_powers_linear"].float().gather(
+            1, target_nearest_index.unsqueeze(-1)
+        ).squeeze(-1)
+        target_nearest_rank = 1 + (
+            (payload["path_powers_linear"].float() > target_nearest_power.unsqueeze(-1))
+            & path_mask
+        ).sum(-1)
+        nearest_valid = measurement.valid & path_mask.any(-1)
+        result["strongest_near_tie_rate"] = float(
+            measurement.near_tie.float().mean()
+        )
+        result["strongest_top2_power_gap_db_mean"] = (
+            float(finite_gap.mean()) if finite_gap.numel() else None
+        )
+        result["target_nearest_path_top1_rate"] = float(
+            (
+                target_nearest_index[nearest_valid]
+                == measurement.path_index[nearest_valid]
+            )
+            .float()
+            .mean()
+        )
+        result["target_nearest_path_power_rank_mean"] = float(
+            target_nearest_rank[nearest_valid].float().mean()
+        )
+        result["target_nearest_path_error_deg_mean"] = float(
+            per_path_error.gather(
+                1, target_nearest_index.unsqueeze(-1)
+            )[nearest_valid].mean()
+        )
+        anchor_pre_repair = payload.get("strongest_anchor_pre_repair_aod_deg")
+        if anchor_pre_repair is not None:
+            anchor_pre_repair_error = circular_distance_degrees(
+                anchor_pre_repair.float(), target_angle.float()
+            )
+        else:
+            anchor_offset = payload.get("strongest_anchor_predicted_offset_deg")
+            anchor_pre_repair_error = (
+                anchor_offset.float().abs() if anchor_offset is not None else None
+            )
+        if anchor_pre_repair_error is not None:
+            finite_anchor = anchor_pre_repair_error[
+                torch.isfinite(anchor_pre_repair_error)
+            ]
+        else:
+            finite_anchor = torch.empty(0, device=target_angle.device)
+        if finite_anchor.numel():
+            result["anchor_pre_repair_error_deg_mean"] = float(
+                finite_anchor.mean()
+            )
+            result["anchor_pre_repair_error_deg_p95"] = float(
+                torch.quantile(finite_anchor, 0.95)
+            )
+            result["anchor_pre_repair_hit_at_10deg"] = float(
+                (finite_anchor <= 10.0).float().mean()
+            )
+            result["anchor_structural_correction_over_10deg_rate"] = float(
+                (finite_anchor > 10.0).float().mean()
+            )
+    elif bool(valid.any()):
+        result["mean_aod_concentration_mean"] = float(confidence[valid].mean())
     result["expected_candidates_per_accepted_at_10deg"] = 1.0 / max(
         float(result["hit_at_10deg"]), 1e-12
     )
@@ -118,7 +201,9 @@ def _macro(records: list[dict[str, Any]], labels: tuple[str, ...]) -> dict[str, 
             for metric in METRIC_NAMES
         }
         control_keys = (
+            "aod_error_deg",
             "mean_aod_error_deg",
+            "strongest_aod_error_deg",
             "p95_aod_error_deg",
             "hit_at_5deg",
             "hit_at_10deg",
@@ -126,6 +211,17 @@ def _macro(records: list[dict[str, Any]], labels: tuple[str, ...]) -> dict[str, 
             "physical_feasible_rate",
             "generated_high_support_rate",
             "generated_support_count_mean",
+            "controlled_aod_valid_rate",
+            "strongest_near_tie_rate",
+            "strongest_top2_power_gap_db_mean",
+            "target_nearest_path_top1_rate",
+            "target_nearest_path_power_rank_mean",
+            "target_nearest_path_error_deg_mean",
+            "anchor_pre_repair_error_deg_mean",
+            "anchor_pre_repair_error_deg_p95",
+            "anchor_pre_repair_hit_at_10deg",
+            "anchor_structural_correction_over_10deg_rate",
+            "mean_aod_concentration_mean",
         )
         control = {
             key: sum(
@@ -176,8 +272,11 @@ def _macro(records: list[dict[str, Any]], labels: tuple[str, ...]) -> dict[str, 
     return result
 
 
-def _rank_selection(macro: Mapping[str, Any]) -> dict[str, Any]:
-    available = [label for label in CANDIDATE_LABELS if label in macro]
+def _rank_selection(
+    macro: Mapping[str, Any],
+    candidate_labels: tuple[str, ...] = MEAN_CANDIDATE_LABELS,
+) -> dict[str, Any]:
+    available = [label for label in candidate_labels if label in macro]
     if not available:
         return {
             "selected_label": None,
@@ -206,7 +305,7 @@ def _rank_selection(macro: Mapping[str, Any]) -> dict[str, Any]:
         values = {
             label: (
                 macro[label]["control"][metric]
-                if metric == "mean_aod_error_deg"
+                if metric == "aod_error_deg"
                 else macro[label]["fidelity"][metric]
             )
             for label in eligible
@@ -220,7 +319,7 @@ def _rank_selection(macro: Mapping[str, Any]) -> dict[str, Any]:
     selected = min(
         eligible,
         key=lambda label: (
-            scores[label], macro[label]["control"]["mean_aod_error_deg"]
+            scores[label], macro[label]["control"]["aod_error_deg"]
         ),
     )
     return {
@@ -254,16 +353,30 @@ def main() -> None:
     args = parser.parse_args()
     device = resolve_device(args.device)
     source = torch.load(args.artifact, map_location="cpu", weights_only=False)
-    if source.get("model_kind") != "aod_conditioned_cfg_link_fidelity_comparison":
+    if source.get("model_kind") not in {
+        "aod_conditioned_cfg_link_fidelity_comparison",
+        "aod_conditioned_cfg_fidelity_comparison",
+    }:
         raise ValueError("unsupported conditional-fidelity artifact")
-    labels = ("real_query", BASELINE_LABEL, *CANDIDATE_LABELS)
+    condition_type = source.get("condition_type", "mean")
+    candidate_labels = tuple(
+        label
+        for label in MEAN_CANDIDATE_LABELS
+        if label in source["payloads"]
+    )
+    if not candidate_labels:
+        raise ValueError("conditional-fidelity artifact has no CFG candidates")
+    labels = ("real_query", BASELINE_LABEL, *candidate_labels)
     payloads = {
         "reference": _to_device(source["payloads"]["reference"], device),
         **{
             label: _to_device(source["payloads"][label], device) for label in labels
         },
     }
-    target = source["target_mean_aod_deg"].to(device)
+    target = source.get("target_aod_deg", source.get("target_mean_aod_deg"))
+    if not isinstance(target, torch.Tensor):
+        raise ValueError("conditional-fidelity artifact has no controlled AoD target")
+    target = target.to(device)
     generated_support = {
         label: values.to(device)
         for label, values in source["generated_real_support_count"].items()
@@ -301,6 +414,7 @@ def main() -> None:
                 if label in generated_support
                 else None,
                 minimum_support,
+                condition_type,
             )
             for label in labels
         }
@@ -328,6 +442,7 @@ def main() -> None:
                             if label in generated_support
                             else None,
                             minimum_support,
+                            condition_type,
                         )
                         for label in labels
                     },
@@ -352,7 +467,7 @@ def main() -> None:
         for los_value in (0, 1)
     }
     comparisons: dict[str, Any] = {}
-    for label in CANDIDATE_LABELS:
+    for label in candidate_labels:
         section: dict[str, Any] = {}
         for metric in (
             "path_level_power_aod_sliced_wasserstein",
@@ -380,14 +495,14 @@ def main() -> None:
     validation_selection = None
     frozen_selection = None
     if source["split"] == "validation":
-        unified_selection = _rank_selection(macro)
+        unified_selection = _rank_selection(macro, candidate_labels)
         if unified_selection["selected_label"] is None:
             raise RuntimeError(
                 "Validation has no supported Map groups for unified model selection"
             )
         los_selection: dict[str, Any] = {}
         for los_value in ("0", "1"):
-            current = _rank_selection(by_los[los_value])
+            current = _rank_selection(by_los[los_value], candidate_labels)
             if current["selected_label"] is None:
                 current = dict(current)
                 current["selected_label"] = unified_selection["selected_label"]
@@ -413,6 +528,7 @@ def main() -> None:
     report = {
         "format_version": 1,
         "evaluation": "map_condition_aod_conditional_fidelity",
+        "condition_type": condition_type,
         "split": source["split"],
         "artifact": str(Path(args.artifact).resolve()),
         "metric_direction": {
@@ -431,6 +547,7 @@ def main() -> None:
                 "Validation-only weighted ranks with a predeclared Hit@10 and physical "
                 "feasibility gate; Test consumes the frozen Validation selection."
             ),
+            "candidate_labels": list(candidate_labels),
         },
         "normalization_audit": evaluator.audit,
         "macro_per_map": macro,

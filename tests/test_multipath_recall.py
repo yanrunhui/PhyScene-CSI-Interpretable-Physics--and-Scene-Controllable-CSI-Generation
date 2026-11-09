@@ -31,6 +31,16 @@ def test_self_centered_view_is_invariant_to_common_aod_rotation() -> None:
     assert torch.allclose(first, second, atol=1e-5, rtol=0.0)
 
 
+def test_strongest_self_centered_view_is_rotation_invariant() -> None:
+    first = multipath_view_features(
+        _payload(), view="self_centered", condition_type="strongest"
+    )
+    second = multipath_view_features(
+        _payload(75.0), view="self_centered", condition_type="strongest"
+    )
+    assert torch.allclose(first, second, atol=1e-5, rtol=0.0)
+
+
 def test_absolute_view_retains_common_aod_rotation() -> None:
     first = multipath_view_features(_payload(), view="absolute")
     second = multipath_view_features(_payload(75.0), view="absolute")

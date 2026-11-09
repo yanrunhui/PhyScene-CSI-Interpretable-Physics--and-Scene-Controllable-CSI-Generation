@@ -1,0 +1,91 @@
+statistics_path: artifacts/statistics/diffusion_strongest_aod_anchor.json
+statistics_batch_size: 512
+
+# Strongest Anchor keeps the original delay-ranked path contract, but encodes
+# every path AoD relative to the real final-power strongest direction.  At
+# inference the target angle and Map remain explicit conditions; this is not an
+# unconditional sample followed by a whole-link rotation.
+aod_conditioned_data:
+  condition_type: strongest
+  path_count: 5
+  minimum_concentration: 0.10
+  reject_low_concentration: false
+  training_shuffle_block_size: 2048
+
+multipath_diffusion:
+  max_paths: 5
+  hidden_dim: 256
+  condition_embedding_dim: 128
+  layers: 4
+  attention_heads: 8
+  dropout: 0.05
+  diffusion_steps: 1000
+  cosine_offset: 0.008
+  clip_denoised: 5.0
+  condition_dropout: 0.10
+  path_count_loss_weight: 0.0
+  freeze_path_count_model: true
+  aod_conditioning:
+    enabled: true
+    condition_type: strongest
+    hidden_dim: 256
+    dropout: 0.05
+    # The angle identity is guaranteed by the representation, so no separate
+    # AoD auxiliary is used.
+    loss_weight: 0.0
+    maximum_timestep_fraction: 0.10
+    reuse_initialization_statistics: true
+    anchor_parameterization:
+      enabled: true
+      relative_aod: true
+      force_final_top1: true
+      preserve_delay_order: true
+      reassert_after_power_changing_stage: true
+  scene_conditioning:
+    enabled: true
+    embedding_dim: 32
+    fusion_hidden_dim: 256
+    dropout: 0.05
+    map_id_to_index: {}
+  path_count:
+    class_weight_power: 0.5
+    max_weight_ratio: 4.0
+    prior_correction: true
+    label_smoothing: 0.01
+  parameterization:
+    mode: structured
+    structured_delay: true
+    structured_power: true
+    structured_k_factor: true
+    epsilon: 1.0e-20
+  constraints:
+    enforce_total_power: true
+    enforce_delay_spread: true
+    enforce_k_factor: true
+    enforce_los_direct_path: true
+    epsilon: 1.0e-20
+
+sampling:
+  sampler: ddim
+  sampling_steps: 100
+  eta: 0.0
+  guidance_scale: 1.0
+  path_count_temperature: 1.0
+
+train:
+  seed: 2026
+  device: auto
+  epochs: 20
+  batch_size: 256
+  num_workers: 4
+  learning_rate: 5.0e-5
+  weight_decay: 1.0e-5
+  gradient_clip_norm: 1.0
+  mixed_precision: false
+  amp_initial_scale: 4096
+  ema_decay: 0.999
+  patience: 8
+  lr_patience: 3
+  lr_reduce_factor: 0.5
+  checkpoint_dir: artifacts/checkpoints/strongest_aod_anchor_b3
+  log_every_steps: 20

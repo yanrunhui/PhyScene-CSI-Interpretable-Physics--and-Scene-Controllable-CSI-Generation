@@ -14,7 +14,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from physics_csi.data.delay_power_residual import DelayPowerResidualCacheDataset
-from physics_csi.evaluation.aod_support import generated_support_counts, mean_aod
+from physics_csi.evaluation.aod_support import (
+    conditioned_aod_measurement,
+    enforce_final_strongest_anchor,
+    generated_support_counts,
+)
 from physics_csi.models.diffusion.multipath_diffusion import MultipathDiffusionModel
 from physics_csi.models.scene_delay_power_residual import SceneConditionedDelayPowerResidual
 from physics_csi.models.scene_link_global_aod_residual import (
@@ -104,6 +108,9 @@ def main() -> None:
     parser.add_argument("--sampling-steps", type=int, default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--condition-type", choices=["mean", "strongest"], default="mean"
+    )
     args = parser.parse_args()
     if args.batch_size < 1:
         raise ValueError("batch-size must be positive")
@@ -113,6 +120,8 @@ def main() -> None:
     plan = torch.load(args.pair_plan, map_location="cpu", weights_only=False)
     if plan.get("kind") != "map_condition_aod_supported_pair_plan":
         raise ValueError("pair plan has an unsupported kind")
+    if plan.get("condition_type", "mean") != args.condition_type:
+        raise ValueError("pair plan and requested AoD condition type do not match")
     if plan.get("cache_scene_plan_fingerprint") != cache.get("scene_plan_fingerprint"):
         raise ValueError("pair plan and cache use different scene splits")
     dataset = DelayPowerResidualCacheDataset(cache, plan["split"])
@@ -124,9 +133,32 @@ def main() -> None:
     aod_checkpoint = torch.load(
         args.aod_checkpoint, map_location="cpu", weights_only=False
     )
-    if aod_checkpoint.get("model_kind") != "multipath_diffusion_scene_id_aod_conditioned":
-        raise ValueError("invalid AoD-conditioned B3 checkpoint")
+    expected_model_kinds = (
+        {
+            "multipath_diffusion_scene_id_strongest_aod_conditioned",
+            "multipath_diffusion_scene_id_strongest_aod_anchor",
+        }
+        if args.condition_type == "strongest"
+        else {"multipath_diffusion_scene_id_aod_conditioned"}
+    )
+    if aod_checkpoint.get("model_kind") not in expected_model_kinds:
+        raise ValueError(
+            f"invalid {args.condition_type}-AoD-conditioned B3 checkpoint"
+        )
     config = aod_checkpoint["config"]
+    checkpoint_condition_type = (
+        config["multipath_diffusion"]
+        .get("aod_conditioning", {})
+        .get("condition_type", "mean")
+    )
+    if checkpoint_condition_type != args.condition_type:
+        raise ValueError("checkpoint AoD condition type is inconsistent")
+    strongest_anchor_enabled = bool(
+        config["multipath_diffusion"]
+        .get("aod_conditioning", {})
+        .get("anchor_parameterization", {})
+        .get("enabled", False)
+    )
     if (
         config["scene_id_experiment"]["fingerprint"]
         != cache["scene_plan_fingerprint"]
@@ -154,16 +186,19 @@ def main() -> None:
     sampling = config["sampling"]
     sampling_steps = args.sampling_steps or int(sampling["sampling_steps"])
     forced_l = int(config.get("aod_conditioned_data", {}).get("path_count", 5))
-    labels = (
+    labels = [
         "reference",
         "real_query",
         "baseline_b3_dp_link",
+        "aod_cfg1_raw",
+        "aod_cfg2_raw",
+        "aod_cfg3_raw",
         "aod_cfg1_dp",
         "aod_cfg2_dp",
         "aod_cfg3_dp",
-        "aod_cfg2_dp_link",
-        "aod_cfg3_dp_link",
-    )
+    ]
+    if args.condition_type == "mean":
+        labels.extend(("aod_cfg2_dp_link", "aod_cfg3_dp_link"))
     chunks: dict[str, dict[str, list[torch.Tensor]]] = {
         label: {} for label in labels
     }
@@ -180,7 +215,13 @@ def main() -> None:
             validity = real_query["condition_validity"].bool()
             map_ids = real_query["map_id"].long()
             map_index = aod_model.map_indices(map_ids, map_ids.numel(), device)
-            target_angle, _ = mean_aod(real_query)
+            target_angle, target_valid, _ = conditioned_aod_measurement(
+                real_query, condition_type=args.condition_type
+            )
+            if not bool(target_valid.all()):
+                raise RuntimeError(
+                    "support plan contains an invalid or ambiguous controlled-AoD target"
+                )
 
             # Original five-condition reference baseline.
             baseline_dp_output = dp_model(
@@ -195,11 +236,17 @@ def main() -> None:
             )
             _decorate(baseline, conditions, validity, map_ids, synthesizer)
 
+            generated_raw: dict[int, dict[str, torch.Tensor]] = {}
             generated_dp: dict[int, dict[str, torch.Tensor]] = {}
             generated_link: dict[int, dict[str, torch.Tensor]] = {}
             for scale in (1, 2, 3):
                 # Reset the generator for a paired CFG comparison: only s changes.
                 generator = torch.Generator(device=device).manual_seed(args.seed + start)
+                aod_arguments = (
+                    {"strongest_aod_az_deg": target_angle}
+                    if args.condition_type == "strongest"
+                    else {"mean_aod_az_deg": target_angle}
+                )
                 generated = aod_model.generate(
                     conditions,
                     conditions.shape[0],
@@ -212,17 +259,23 @@ def main() -> None:
                         sampling.get("path_count_temperature", 1.0)
                     ),
                     forced_path_count=forced_l,
-                    mean_aod_az_deg=target_angle,
                     map_id=map_ids,
                     generator=generator,
+                    **aod_arguments,
                 )
+                _decorate(generated, conditions, validity, map_ids, synthesizer)
+                generated_raw[scale] = generated
                 dp_output = dp_model(
                     generated, conditions, validity, map_index=map_index
                 )
                 dp_payload = dp_model.apply_to_payload(generated, dp_output)
+                if strongest_anchor_enabled:
+                    dp_payload = enforce_final_strongest_anchor(
+                        dp_payload, target_angle
+                    )
                 _decorate(dp_payload, conditions, validity, map_ids, synthesizer)
                 generated_dp[scale] = dp_payload
-                if scale in (2, 3):
+                if args.condition_type == "mean" and scale in (2, 3):
                     link_output = link_model(
                         dp_payload, conditions, validity, map_index=map_index
                     )
@@ -237,12 +290,18 @@ def main() -> None:
                 "reference": reference,
                 "real_query": real_query,
                 "baseline_b3_dp_link": baseline,
+                "aod_cfg1_raw": generated_raw[1],
+                "aod_cfg2_raw": generated_raw[2],
+                "aod_cfg3_raw": generated_raw[3],
                 "aod_cfg1_dp": generated_dp[1],
                 "aod_cfg2_dp": generated_dp[2],
                 "aod_cfg3_dp": generated_dp[3],
-                "aod_cfg2_dp_link": generated_link[2],
-                "aod_cfg3_dp_link": generated_link[3],
             }
+            if args.condition_type == "mean":
+                batch_payloads.update(
+                    aod_cfg2_dp_link=generated_link[2],
+                    aod_cfg3_dp_link=generated_link[3],
+                )
             for label, payload in batch_payloads.items():
                 _append(chunks[label], payload)
             targets.append(target_angle.cpu())
@@ -279,13 +338,15 @@ def main() -> None:
             maximum_angle_distance_deg=float(
                 support_protocol["maximum_circular_angle_distance_deg"]
             ),
+            condition_type=args.condition_type,
         )
     artifact = {
-        "format_version": 1,
-        "model_kind": "aod_conditioned_cfg_link_fidelity_comparison",
+        "format_version": 2,
+        "model_kind": "aod_conditioned_cfg_fidelity_comparison",
+        "condition_type": args.condition_type,
         "split": plan["split"],
         "payloads": payloads,
-        "target_mean_aod_deg": target_angle,
+        "target_aod_deg": target_angle,
         "query_real_support_count": torch.cat(query_support),
         "generated_real_support_count": output_support,
         "support_protocol": support_protocol,
@@ -299,6 +360,8 @@ def main() -> None:
             "eta": float(sampling.get("eta", 0.0)),
             "seed": args.seed,
             "paired_noise_across_cfg": True,
+            "strongest_anchor_enabled": strongest_anchor_enabled,
+            "anchor_reasserted_after_dp": strongest_anchor_enabled,
         },
         "sources": {
             "aod_checkpoint": str(Path(args.aod_checkpoint).resolve()),
@@ -308,6 +371,8 @@ def main() -> None:
             "pair_plan": str(Path(args.pair_plan).resolve()),
         },
     }
+    if args.condition_type == "mean":
+        artifact["target_mean_aod_deg"] = target_angle
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(output.suffix + ".tmp")

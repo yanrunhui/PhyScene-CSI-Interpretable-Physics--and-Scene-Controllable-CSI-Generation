@@ -46,6 +46,13 @@ class MultipathDiffusionModel(nn.Module):
         )
         aod_config = dict(config.get("aod_conditioning", {}))
         self.aod_conditioning_enabled = bool(aod_config.get("enabled", False))
+        self.aod_condition_type = str(
+            aod_config.get("condition_type", "mean")
+        ).strip().lower()
+        if self.aod_condition_type not in {"mean", "strongest"}:
+            raise ValueError(
+                "aod_conditioning.condition_type must be 'mean' or 'strongest'"
+            )
         self.aod_conditioner: CircularAoDConditionFusion | None = None
         if self.aod_conditioning_enabled:
             self.aod_conditioner = CircularAoDConditionFusion(
@@ -137,6 +144,39 @@ class MultipathDiffusionModel(nn.Module):
             self.spatial_supervision.get("enabled", False)
         )
         self.aod_conditioning = aod_config
+        if "ranking_supervision" in aod_config:
+            raise ValueError(
+                "ranking_supervision was removed; use Strongest Anchor parameterization"
+            )
+        self.strongest_anchor = dict(
+            aod_config.get("anchor_parameterization", {})
+        )
+        self.strongest_anchor_enabled = bool(
+            self.strongest_anchor.get("enabled", False)
+        )
+        self.strongest_anchor_force_final_top1 = bool(
+            self.strongest_anchor.get("force_final_top1", True)
+        )
+        if self.strongest_anchor_enabled and (
+            not self.aod_conditioning_enabled
+            or self.aod_condition_type != "strongest"
+        ):
+            raise ValueError(
+                "anchor_parameterization is only valid for Strongest-AoD conditioning"
+            )
+        if self.strongest_anchor_enabled and not bool(
+            self.strongest_anchor.get("relative_aod", True)
+        ):
+            raise ValueError(
+                "Strongest Anchor requires anchor_parameterization.relative_aod=true"
+            )
+        if self.strongest_anchor_enabled and not bool(
+            self.strongest_anchor.get("preserve_delay_order", True)
+        ):
+            raise ValueError(
+                "Strongest Anchor v1 requires preserve_delay_order=true so delay, "
+                "power, phase and direct-path identities stay aligned"
+            )
         count_config = dict(config.get("path_count", {}))
         counts = torch.as_tensor(
             statistics.get("path_count_histogram", [0] + [1] * self.max_paths),
@@ -264,6 +304,8 @@ class MultipathDiffusionModel(nn.Module):
         *,
         mean_aod_az_deg: torch.Tensor | None = None,
         mean_aod_validity: torch.Tensor | None = None,
+        strongest_aod_az_deg: torch.Tensor | None = None,
+        strongest_aod_validity: torch.Tensor | None = None,
         map_id: int | torch.Tensor | None = None,
         map_index: torch.Tensor | None = None,
         drop_mask: torch.Tensor | None = None,
@@ -271,17 +313,28 @@ class MultipathDiffusionModel(nn.Module):
         """Encode the complete condition used by both count and denoising branches."""
         physical = self.condition_encoder(conditions, validity)
         if self.aod_conditioning_enabled:
-            if mean_aod_az_deg is None:
-                raise ValueError("Mean AoD is required by an AoD-conditioned model")
-            if mean_aod_validity is None:
-                mean_aod_validity = torch.ones(
+            aod_angle, aod_validity = self._configured_aod_condition(
+                mean_aod_az_deg,
+                mean_aod_validity,
+                strongest_aod_az_deg,
+                strongest_aod_validity,
+            )
+            if aod_angle is None:
+                label = (
+                    "Mean AoD"
+                    if self.aod_condition_type == "mean"
+                    else "Strongest-path AoD"
+                )
+                raise ValueError(f"{label} is required by this AoD-conditioned model")
+            if aod_validity is None:
+                aod_validity = torch.ones(
                     conditions.shape[0], device=conditions.device, dtype=torch.bool
                 )
             assert self.aod_conditioner is not None
             physical = self.aod_conditioner(
                 physical,
-                mean_aod_az_deg,
-                mean_aod_validity,
+                aod_angle,
+                aod_validity,
                 drop_mask=None if self.scene_conditioning_enabled else drop_mask,
             )
         elif not self.scene_conditioning_enabled:
@@ -293,6 +346,85 @@ class MultipathDiffusionModel(nn.Module):
         )
         assert resolved is not None and self.scene_conditioner is not None
         return self.scene_conditioner(physical, resolved, drop_mask=drop_mask)
+
+    def _configured_aod_condition(
+        self,
+        mean_angle: torch.Tensor | None,
+        mean_validity: torch.Tensor | None,
+        strongest_angle: torch.Tensor | None,
+        strongest_validity: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Select the explicit angle input matching this checkpoint's contract."""
+        if mean_angle is not None and strongest_angle is not None:
+            raise ValueError("provide only one AoD condition target")
+        if self.aod_condition_type == "mean":
+            if strongest_angle is not None:
+                raise ValueError("this checkpoint expects Mean AoD, not Strongest-path AoD")
+            return mean_angle, mean_validity
+        if mean_angle is not None:
+            raise ValueError("this checkpoint expects Strongest-path AoD, not Mean AoD")
+        return strongest_angle, strongest_validity
+
+    @staticmethod
+    def _wrap_degrees(angle: torch.Tensor) -> torch.Tensor:
+        radians = torch.deg2rad(angle.float())
+        return torch.rad2deg(torch.atan2(radians.sin(), radians.cos()))
+
+    def _anchor_training_payload(
+        self,
+        batch: Mapping[str, torch.Tensor],
+        target_aod_deg: torch.Tensor | None,
+    ) -> Mapping[str, torch.Tensor]:
+        """Express every path AoD relative to the real strongest-path target.
+
+        Path order is deliberately unchanged. Delay rank, direct-path identity,
+        powers, phases and all other joint path attributes therefore retain the
+        correspondence used by the original B3 representation.
+        """
+        if not self.strongest_anchor_enabled:
+            return batch
+        if target_aod_deg is None:
+            raise KeyError("Strongest Anchor training requires strongest_aod_az_deg")
+        result = dict(batch)
+        result["aod_az_deg"] = self._wrap_degrees(
+            batch["aod_az_deg"].float() - target_aod_deg.float().unsqueeze(-1)
+        )
+        return result
+
+    def _restore_anchor_aod(
+        self,
+        relative_aod_deg: torch.Tensor,
+        target_aod_deg: torch.Tensor,
+        final_powers: torch.Tensor,
+        path_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Restore absolute AoD and bind the anchor to final-power Top1.
+
+        The strongest identity is resolved after structured power/K projection.
+        Only that path's relative offset is set to zero; non-anchor relative
+        angles remain generated variables conditioned on Map and target angle.
+        """
+        mask = path_mask.bool()
+        strongest_index = final_powers.float().masked_fill(~mask, -torch.inf).argmax(-1)
+        anchored_relative = relative_aod_deg.float().clone()
+        predicted_offset = anchored_relative.gather(
+            1, strongest_index.unsqueeze(-1)
+        ).squeeze(-1)
+        if self.strongest_anchor_force_final_top1:
+            anchored_relative.scatter_(
+                1,
+                strongest_index.unsqueeze(-1),
+                torch.zeros(
+                    strongest_index.shape,
+                    device=anchored_relative.device,
+                    dtype=anchored_relative.dtype,
+                ).unsqueeze(-1),
+            )
+        absolute = self._wrap_degrees(
+            anchored_relative + target_aod_deg.float().unsqueeze(-1)
+        )
+        absolute = torch.where(mask, absolute, torch.zeros_like(absolute))
+        return absolute, anchored_relative, strongest_index, predicted_offset
 
     def unconditional_embedding(
         self, batch_size: int, device: torch.device
@@ -389,6 +521,14 @@ class MultipathDiffusionModel(nn.Module):
         validity = batch.get("condition_validity")
         mean_aod_az_deg = batch.get("mean_aod_az_deg")
         mean_aod_validity = batch.get("mean_aod_valid")
+        strongest_aod_az_deg = batch.get("strongest_aod_az_deg")
+        strongest_aod_validity = batch.get("strongest_aod_valid")
+        aod_target, aod_target_validity = self._configured_aod_condition(
+            mean_aod_az_deg,
+            mean_aod_validity,
+            strongest_aod_az_deg,
+            strongest_aod_validity,
+        )
         map_id = batch.get("map_id")
         map_index = batch.get("map_index")
         resolved_map_index = self.map_indices(
@@ -402,6 +542,8 @@ class MultipathDiffusionModel(nn.Module):
             validity,
             mean_aod_az_deg=mean_aod_az_deg,
             mean_aod_validity=mean_aod_validity,
+            strongest_aod_az_deg=strongest_aod_az_deg,
+            strongest_aod_validity=strongest_aod_validity,
             map_id=map_id,
             map_index=resolved_map_index,
         )
@@ -419,7 +561,8 @@ class MultipathDiffusionModel(nn.Module):
         bias = self._path_count_logit_bias()
         if bias is not None:
             corrected_logits = corrected_logits + bias.to(corrected_logits)
-        features, feature_mask = self.representation.encode(batch)
+        representation_batch = self._anchor_training_payload(batch, aod_target)
+        features, feature_mask = self.representation.encode(representation_batch)
         drop_mask = torch.zeros(conditions.shape[0], device=conditions.device, dtype=torch.bool)
         if self.training and self.condition_dropout > 0.0:
             drop_mask = (
@@ -431,6 +574,8 @@ class MultipathDiffusionModel(nn.Module):
             validity,
             mean_aod_az_deg=mean_aod_az_deg,
             mean_aod_validity=mean_aod_validity,
+            strongest_aod_az_deg=strongest_aod_az_deg,
+            strongest_aod_validity=strongest_aod_validity,
             map_id=map_id,
             map_index=resolved_map_index,
             drop_mask=drop_mask,
@@ -466,14 +611,21 @@ class MultipathDiffusionModel(nn.Module):
             ).float().mean(),
         }
         if self.aod_conditioning_enabled:
-            if mean_aod_az_deg is None:
-                raise KeyError("AoD-conditioned training batch has no Mean-AoD label")
+            if aod_target is None:
+                label = (
+                    "Mean-AoD"
+                    if self.aod_condition_type == "mean"
+                    else "Strongest-path AoD"
+                )
+                raise KeyError(f"AoD-conditioned training batch has no {label} label")
             angle_auxiliary = self._aod_condition_auxiliary(
                 prediction["predicted_clean"],
                 prediction["timestep"],
                 batch,
-                mean_aod_az_deg,
-                mean_aod_validity,
+                conditions,
+                validity,
+                aod_target,
+                aod_target_validity,
                 drop_mask,
             )
             angle_weight = float(self.aod_conditioning.get("loss_weight", 0.0))
@@ -509,7 +661,9 @@ class MultipathDiffusionModel(nn.Module):
         predicted_clean: torch.Tensor,
         timesteps: torch.Tensor,
         batch: Mapping[str, torch.Tensor],
-        target_mean_aod_deg: torch.Tensor,
+        conditions: torch.Tensor,
+        condition_validity: torch.Tensor | None,
+        target_aod_deg: torch.Tensor,
         target_validity: torch.Tensor | None,
         drop_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
@@ -520,7 +674,7 @@ class MultipathDiffusionModel(nn.Module):
             raise ValueError("AoD maximum_timestep_fraction must be in (0, 1]")
         maximum_timestep = max(0, int(self.diffusion.timesteps * maximum_fraction) - 1)
         valid = (
-            torch.ones_like(target_mean_aod_deg, dtype=torch.bool)
+            torch.ones_like(target_aod_deg, dtype=torch.bool)
             if target_validity is None
             else target_validity.bool()
         )
@@ -528,31 +682,82 @@ class MultipathDiffusionModel(nn.Module):
         selected_fraction = selected.float().mean()
         if not bool(selected.any()):
             zero = predicted_clean.sum() * 0.0
-            return {
+            result = {
                 "aod_condition_loss": zero,
                 "aod_condition_error_deg": zero,
                 "aod_condition_supervision_fraction": selected_fraction,
             }
+            if self.aod_condition_type == "strongest":
+                result.update(
+                    strongest_delay_rank_accuracy=zero,
+                    strongest_near_tie_fraction=zero,
+                )
+            return result
         clipped = predicted_clean[selected].clamp(
             -float(self.config.get("clip_denoised", 5.0)),
             float(self.config.get("clip_denoised", 5.0)),
         )
         path_mask = batch["path_mask"][selected].bool()
         raw = self.representation.decode(clipped, path_mask)
-        weights = raw["positive_power_weights"] * raw["path_mask"]
-        weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-20)
-        predicted_rad = torch.deg2rad(raw["aod_az_deg"])
-        predicted_direction = torch.stack(
-            [
-                (weights * predicted_rad.sin()).sum(-1),
-                (weights * predicted_rad.cos()).sum(-1),
-            ],
-            dim=-1,
-        )
-        predicted_direction = predicted_direction / predicted_direction.norm(
-            dim=-1, keepdim=True
-        ).clamp_min(1e-6)
-        target_rad = torch.deg2rad(target_mean_aod_deg[selected].float())
+        auxiliary_audit: dict[str, torch.Tensor] = {}
+        if self.aod_condition_type == "mean":
+            weights = raw["positive_power_weights"] * raw["path_mask"]
+            weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-20)
+            predicted_rad = torch.deg2rad(raw["aod_az_deg"])
+            predicted_direction = torch.stack(
+                [
+                    (weights * predicted_rad.sin()).sum(-1),
+                    (weights * predicted_rad.cos()).sum(-1),
+                ],
+                dim=-1,
+            )
+            predicted_direction = predicted_direction / predicted_direction.norm(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-6)
+        else:
+            selected_validity = (
+                condition_validity[selected]
+                if condition_validity is not None
+                else torch.ones_like(conditions[selected], dtype=torch.bool)
+            )
+            projected = self.parameterization(
+                raw,
+                conditions[selected],
+                selected_validity,
+            ).constrained
+            decoded_aod = raw["aod_az_deg"]
+            if self.strongest_anchor_enabled:
+                decoded_aod, _, _, _ = self._restore_anchor_aod(
+                    decoded_aod,
+                    target_aod_deg[selected],
+                    projected.powers_linear,
+                    raw["path_mask"],
+                )
+            predicted_angle, predicted_index, gap_db, _ = self._strongest_aod(
+                projected.powers_linear,
+                decoded_aod,
+                raw["path_mask"],
+            )
+            identity = batch.get("strongest_path_index")
+            identity_accuracy = (
+                predicted_clean.sum() * 0.0
+                if identity is None
+                else (predicted_index == identity[selected].long()).float().mean()
+            )
+            predicted_rad = torch.deg2rad(predicted_angle)
+            predicted_direction = torch.stack(
+                [predicted_rad.sin(), predicted_rad.cos()], dim=-1
+            )
+            near_tie_db = float(
+                self.aod_conditioning.get("near_tie_gap_db", 0.5)
+            )
+            auxiliary_audit = {
+                # Both indices are delay ranks in their respective decoded
+                # links; this is an audit, not a differentiable identity loss.
+                "strongest_delay_rank_accuracy": identity_accuracy,
+                "strongest_near_tie_fraction": (gap_db <= near_tie_db).float().mean(),
+            }
+        target_rad = torch.deg2rad(target_aod_deg[selected].float())
         target_direction = torch.stack([target_rad.sin(), target_rad.cos()], dim=-1)
         cosine = (predicted_direction * target_direction).sum(-1).clamp(-1.0, 1.0)
         return {
@@ -561,6 +766,7 @@ class MultipathDiffusionModel(nn.Module):
                 torch.acos(cosine.detach())
             ).mean(),
             "aod_condition_supervision_fraction": selected_fraction,
+            **auxiliary_audit,
         }
 
     def _spatial_auxiliary_losses(
@@ -607,13 +813,26 @@ class MultipathDiffusionModel(nn.Module):
             raw, conditions[selected], selected_validity
         )
         constrained = parameterized.constrained
+        decoded_aod = raw["aod_az_deg"]
+        if self.strongest_anchor_enabled:
+            target = batch.get("strongest_aod_az_deg")
+            if target is None:
+                raise KeyError(
+                    "Strongest Anchor spatial supervision requires strongest_aod_az_deg"
+                )
+            decoded_aod, _, _, _ = self._restore_anchor_aod(
+                decoded_aod,
+                target[selected],
+                constrained.powers_linear,
+                raw["path_mask"],
+            )
         predicted_csi = self.synthesizer(
             constrained.delays_ns,
             constrained.powers_linear,
             raw["path_phases_rad"],
             raw["aoa_az_deg"],
             raw["aoa_el_deg"],
-            raw["aod_az_deg"],
+            decoded_aod,
             raw["aod_el_deg"],
             raw["path_mask"],
         )
@@ -642,6 +861,8 @@ class MultipathDiffusionModel(nn.Module):
         forced_path_count: int | torch.Tensor | None = None,
         mean_aod_az_deg: float | torch.Tensor | None = None,
         mean_aod_validity: bool | torch.Tensor | None = None,
+        strongest_aod_az_deg: float | torch.Tensor | None = None,
+        strongest_aod_validity: bool | torch.Tensor | None = None,
         generator: torch.Generator | None = None,
         map_id: int | torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
@@ -650,9 +871,17 @@ class MultipathDiffusionModel(nn.Module):
         )
         if isinstance(conditions, Mapping) and mean_aod_az_deg is None:
             mean_aod_az_deg = conditions.get("mean_aod_az_deg")
-        aod_target, aod_validity = self._prepare_aod_condition(
+        if isinstance(conditions, Mapping) and strongest_aod_az_deg is None:
+            strongest_aod_az_deg = conditions.get("strongest_aod_az_deg")
+        selected_aod, selected_validity = self._configured_aod_condition(
             mean_aod_az_deg,
             mean_aod_validity,
+            strongest_aod_az_deg,
+            strongest_aod_validity,
+        )
+        aod_target, aod_validity = self._prepare_aod_condition(
+            selected_aod,
+            selected_validity,
             num_samples,
             condition_tensor.device,
         )
@@ -662,8 +891,18 @@ class MultipathDiffusionModel(nn.Module):
         embedding = self.condition_embedding(
             condition_tensor,
             validity,
-            mean_aod_az_deg=aod_target,
-            mean_aod_validity=aod_validity,
+            mean_aod_az_deg=(
+                aod_target if self.aod_condition_type == "mean" else None
+            ),
+            mean_aod_validity=(
+                aod_validity if self.aod_condition_type == "mean" else None
+            ),
+            strongest_aod_az_deg=(
+                aod_target if self.aod_condition_type == "strongest" else None
+            ),
+            strongest_aod_validity=(
+                aod_validity if self.aod_condition_type == "strongest" else None
+            ),
             map_id=map_id,
             map_index=resolved_map_index,
         )
@@ -750,6 +989,24 @@ class MultipathDiffusionModel(nn.Module):
             repair_delay = torch.zeros(num_samples, device=condition_tensor.device, dtype=torch.bool)
         parameterized = self.parameterization(raw, condition_tensor, validity)
         constrained = parameterized.constrained
+        anchor_relative_aod = None
+        anchor_path_index = None
+        anchor_predicted_offset = None
+        if self.strongest_anchor_enabled:
+            if aod_target is None:
+                raise RuntimeError("Strongest Anchor generation has no target angle")
+            (
+                absolute_aod,
+                anchor_relative_aod,
+                anchor_path_index,
+                anchor_predicted_offset,
+            ) = self._restore_anchor_aod(
+                raw["aod_az_deg"],
+                aod_target,
+                constrained.powers_linear,
+                raw["path_mask"],
+            )
+            raw["aod_az_deg"] = absolute_aod
         csi = self.synthesizer(
             constrained.delays_ns,
             constrained.powers_linear,
@@ -811,23 +1068,57 @@ class MultipathDiffusionModel(nn.Module):
                 parameterized_power_fraction - raw_power_fraction
             ).abs().sum(-1),
         }
+        if self.strongest_anchor_enabled:
+            assert anchor_relative_aod is not None
+            assert anchor_path_index is not None
+            assert anchor_predicted_offset is not None
+            result["strongest_anchor_enabled"] = torch.ones(
+                num_samples, device=count.device, dtype=torch.bool
+            )
+            result["strongest_anchor_path_index"] = anchor_path_index
+            result["strongest_anchor_relative_aod_deg"] = anchor_relative_aod
+            result["strongest_anchor_predicted_offset_deg"] = anchor_predicted_offset
+            result["strongest_anchor_was_forced"] = torch.full(
+                (num_samples,),
+                self.strongest_anchor_force_final_top1,
+                device=count.device,
+                dtype=torch.bool,
+            )
         if self.aod_conditioning_enabled:
             assert aod_target is not None and aod_validity is not None
-            actual_mean_aod, actual_concentration = self._mean_aod(
-                constrained.powers_linear,
-                raw["aod_az_deg"],
-                raw["path_mask"],
-            )
-            result["target_mean_aod_az_deg"] = aod_target
-            result["target_mean_aod_validity"] = aod_validity
-            result["actual_mean_aod_az_deg"] = actual_mean_aod
-            result["actual_mean_aod_concentration"] = actual_concentration
-            result["mean_aod_circular_error_deg"] = torch.rad2deg(
-                torch.atan2(
-                    torch.sin(torch.deg2rad(actual_mean_aod - aod_target)),
-                    torch.cos(torch.deg2rad(actual_mean_aod - aod_target)),
+            if self.aod_condition_type == "mean":
+                actual_mean_aod, actual_concentration = self._mean_aod(
+                    constrained.powers_linear,
+                    raw["aod_az_deg"],
+                    raw["path_mask"],
                 )
-            ).abs()
+                result["target_mean_aod_az_deg"] = aod_target
+                result["target_mean_aod_validity"] = aod_validity
+                result["actual_mean_aod_az_deg"] = actual_mean_aod
+                result["actual_mean_aod_concentration"] = actual_concentration
+                result["mean_aod_circular_error_deg"] = self._circular_error_deg(
+                    actual_mean_aod, aod_target
+                )
+            else:
+                (
+                    actual_strongest_aod,
+                    actual_strongest_index,
+                    strongest_gap_db,
+                    strongest_valid,
+                ) = self._strongest_aod(
+                    constrained.powers_linear,
+                    raw["aod_az_deg"],
+                    raw["path_mask"],
+                )
+                result["target_strongest_aod_az_deg"] = aod_target
+                result["target_strongest_aod_validity"] = aod_validity
+                result["actual_strongest_aod_az_deg"] = actual_strongest_aod
+                result["actual_strongest_path_index"] = actual_strongest_index
+                result["actual_strongest_aod_valid"] = strongest_valid
+                result["strongest_top2_power_gap_db"] = strongest_gap_db
+                result["strongest_aod_circular_error_deg"] = self._circular_error_deg(
+                    actual_strongest_aod, aod_target
+                )
         if "path_delays_ns" in raw:
             result["raw_path_delays_ns"] = raw["path_delays_ns"]
         if "relative_delay_shape" in raw:
@@ -856,6 +1147,53 @@ class MultipathDiffusionModel(nn.Module):
         concentration = torch.sqrt(sine.square() + cosine.square()).clamp(0.0, 1.0)
         return torch.rad2deg(torch.atan2(sine, cosine)), concentration
 
+    @staticmethod
+    def _strongest_aod(
+        powers_linear: torch.Tensor,
+        aod_az_deg: torch.Tensor,
+        path_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Measure the deterministic strongest active path in the current ordering."""
+        mask = path_mask.bool()
+        powers = powers_linear.float()
+        angles = aod_az_deg.float()
+        if powers.shape != mask.shape or angles.shape != mask.shape:
+            raise ValueError("power, AoD and path mask must share [batch, path]")
+        if powers.ndim != 2:
+            raise ValueError("strongest-path AoD expects [batch, path] tensors")
+        finite_power = torch.isfinite(powers.masked_fill(~mask, 0.0)).all(-1)
+        nonnegative = ((powers >= 0.0) | ~mask).all(-1)
+        masked = powers.masked_fill(~mask, -torch.inf)
+        index = masked.argmax(-1)
+        strongest_power = masked.gather(1, index.unsqueeze(-1)).squeeze(-1)
+        angle = angles.gather(1, index.unsqueeze(-1)).squeeze(-1)
+        active_count = mask.sum(-1)
+        top = masked.topk(min(2, masked.shape[-1]), dim=-1).values
+        second = top[:, 1] if top.shape[1] > 1 else torch.zeros_like(strongest_power)
+        gap_db = 10.0 * torch.log10(
+            strongest_power.clamp_min(1e-20) / second.clamp_min(1e-20)
+        )
+        gap_db = torch.where(
+            (active_count >= 2) & (second > 0.0),
+            gap_db,
+            torch.full_like(gap_db, torch.inf),
+        )
+        valid = (
+            (active_count > 0)
+            & finite_power
+            & nonnegative
+            & (strongest_power > 0.0)
+            & torch.isfinite(angle)
+        )
+        return angle, index, gap_db, valid
+
+    @staticmethod
+    def _circular_error_deg(
+        actual_deg: torch.Tensor, target_deg: torch.Tensor
+    ) -> torch.Tensor:
+        difference = torch.deg2rad(actual_deg - target_deg)
+        return torch.rad2deg(torch.atan2(difference.sin(), difference.cos())).abs()
+
     def _prepare_aod_condition(
         self,
         value: float | torch.Tensor | None,
@@ -866,14 +1204,19 @@ class MultipathDiffusionModel(nn.Module):
         if not self.aod_conditioning_enabled:
             return None, None
         if value is None:
-            raise ValueError("mean_aod_az_deg is required by this checkpoint")
+            name = (
+                "mean_aod_az_deg"
+                if self.aod_condition_type == "mean"
+                else "strongest_aod_az_deg"
+            )
+            raise ValueError(f"{name} is required by this checkpoint")
         angle = torch.as_tensor(value, device=device, dtype=torch.float32).reshape(-1)
         if angle.shape[0] == 1:
             angle = angle.expand(num_samples)
         if angle.shape != (num_samples,):
-            raise ValueError("mean_aod_az_deg must be scalar or have shape [num_samples]")
+            raise ValueError("AoD condition must be scalar or have shape [num_samples]")
         if not bool(torch.isfinite(angle).all()):
-            raise ValueError("mean_aod_az_deg must be finite")
+            raise ValueError("AoD condition must be finite")
         angle = torch.rad2deg(
             torch.atan2(torch.sin(torch.deg2rad(angle)), torch.cos(torch.deg2rad(angle)))
         )
@@ -884,7 +1227,7 @@ class MultipathDiffusionModel(nn.Module):
             if valid.shape[0] == 1:
                 valid = valid.expand(num_samples)
             if valid.shape != (num_samples,):
-                raise ValueError("mean_aod_validity must be scalar or [num_samples]")
+                raise ValueError("AoD condition validity must be scalar or [num_samples]")
         return angle, valid
 
     def _prepare_conditions(

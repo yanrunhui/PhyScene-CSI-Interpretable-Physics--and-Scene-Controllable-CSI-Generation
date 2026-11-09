@@ -60,19 +60,20 @@ def main() -> None:
     selection = values["validation"]["validation_selection"]
     selected = {
         "baseline_b3_dp_link",
-        "aod_cfg1_dp",
-        "aod_cfg2_dp",
-        "aod_cfg3_dp",
-        "aod_cfg2_dp_link",
-        "aod_cfg3_dp_link",
         selection["unified"]["selected_label"],
         selection["by_los"]["0"]["selected_label"],
         selection["by_los"]["1"]["selected_label"],
         "real_query",
     }
+    selected.update(
+        label
+        for label in values["validation"]["macro_per_map"]
+        if label.startswith("aod_cfg")
+    )
     summary = {
         "format_version": 1,
         "diagnostic": "aod_conditional_fidelity_validation_test_summary",
+        "condition_type": values["validation"].get("condition_type", "mean"),
         "support": {
             split: values[f"support_{split}"][
                 "support_summary_for_selected_path_count"

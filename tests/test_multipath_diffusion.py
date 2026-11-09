@@ -4,7 +4,9 @@ import torch
 import pytest
 
 from physics_csi.models.blocks import mask_from_path_count
-from physics_csi.models.diffusion.multipath_diffusion import MultipathDiffusionModel
+from physics_csi.models.diffusion.multipath_diffusion import (
+    MultipathDiffusionModel,
+)
 from physics_csi.models.diffusion.noise_schedule import GaussianDiffusion
 from physics_csi.physics.constraints import PhysicsConstraintLayer
 from physics_csi.physics.parameterization import PhysicsAwareParameterization
@@ -282,6 +284,178 @@ def test_aod_conditioned_diffusion_is_periodic_and_receives_gradients() -> None:
     assert generated["target_mean_aod_az_deg"].tolist() == [38.5, 38.5]
     assert generated["mean_aod_circular_error_deg"].shape == (2,)
     assert torch.isfinite(generated["actual_mean_aod_az_deg"]).all()
+
+
+def test_strongest_aod_condition_uses_final_power_argmax() -> None:
+    config = _config()
+    config["condition_dropout"] = 0.0
+    config["aod_conditioning"] = {
+        "enabled": True,
+        "condition_type": "strongest",
+        "hidden_dim": 32,
+        "loss_weight": 0.1,
+        "maximum_timestep_fraction": 1.0,
+    }
+    config["scene_conditioning"] = {
+        "enabled": True,
+        "embedding_dim": 8,
+        "fusion_hidden_dim": 32,
+        "map_id_to_index": {"0": 0, "7": 1},
+    }
+    model = MultipathDiffusionModel(
+        config,
+        SystemConfig(num_subcarriers=8, tx_array_shape=(2, 2)),
+        _stats(),
+    )
+    physical = _batch()["conditions"][:1].expand(2, -1)
+    validity = _batch()["condition_validity"][:1].expand(2, -1)
+    periodic = model.condition_embedding(
+        physical,
+        validity,
+        strongest_aod_az_deg=torch.tensor([-180.0, 180.0]),
+        strongest_aod_validity=torch.ones(2, dtype=torch.bool),
+        map_id=torch.tensor([0, 0]),
+    )
+    assert torch.allclose(periodic[0], periodic[1], atol=1e-6)
+
+    angle, index, gap_db, valid = model._strongest_aod(
+        torch.tensor([[0.1, 0.7, 99.0], [0.4, 0.4, 0.2]]),
+        torch.tensor([[10.0, 80.0, -120.0], [30.0, -60.0, 90.0]]),
+        torch.tensor([[True, True, False], [True, True, True]]),
+    )
+    assert angle.tolist() == [80.0, 30.0]
+    assert index.tolist() == [1, 0]
+    assert float(gap_db[0]) > 8.0
+    assert float(gap_db[1]) == pytest.approx(0.0)
+    assert valid.tolist() == [True, True]
+
+    batch = _batch()
+    batch["map_id"] = torch.tensor([0, 7])
+    batch["strongest_aod_az_deg"] = torch.tensor([90.0, 45.0])
+    batch["strongest_aod_valid"] = torch.ones(2, dtype=torch.bool)
+    batch["strongest_path_index"] = torch.tensor([0, 0])
+    batch["strongest_top2_power_gap_db"] = torch.tensor([6.0, 3.0])
+    metrics = model(batch)
+    assert set(metrics) >= {
+        "aod_condition_loss",
+        "aod_condition_error_deg",
+        "strongest_delay_rank_accuracy",
+        "strongest_near_tie_fraction",
+    }
+    assert all(torch.isfinite(value) for value in metrics.values())
+    metrics["loss"].backward()
+    gradient = model.aod_condition_gradient_norm()
+    assert gradient is not None and float(gradient) > 0.0
+
+    model.eval()
+    conditions = {
+        "total_power_db": -80.0,
+        "delay_spread_ns": 10.0,
+        "k_factor_db": 3.0,
+        "los_status": 1,
+    }
+    generated = model.generate(
+        conditions,
+        2,
+        map_id=7,
+        strongest_aod_az_deg=38.5,
+        forced_path_count=3,
+        sampling_steps=2,
+        generator=torch.Generator().manual_seed(37),
+    )
+    assert generated["target_strongest_aod_az_deg"].tolist() == [38.5, 38.5]
+    assert generated["strongest_aod_circular_error_deg"].shape == (2,)
+    expected_index = generated["path_powers_linear"].argmax(-1)
+    assert torch.equal(generated["actual_strongest_path_index"], expected_index)
+    expected_angle = generated["aod_az_deg"].gather(
+        1, expected_index.unsqueeze(-1)
+    ).squeeze(-1)
+    assert torch.allclose(generated["actual_strongest_aod_az_deg"], expected_angle)
+
+
+def test_strongest_anchor_uses_relative_training_aod_and_final_power_identity() -> None:
+    config = _config()
+    config["condition_dropout"] = 0.0
+    config["aod_conditioning"] = {
+        "enabled": True,
+        "condition_type": "strongest",
+        "hidden_dim": 32,
+        "loss_weight": 0.0,
+        "maximum_timestep_fraction": 1.0,
+        "anchor_parameterization": {
+            "enabled": True,
+            "relative_aod": True,
+            "force_final_top1": True,
+        },
+    }
+    model = MultipathDiffusionModel(
+        config,
+        SystemConfig(num_subcarriers=8, tx_array_shape=(2, 2)),
+        _stats(),
+    )
+    batch = _batch()
+    batch["strongest_aod_az_deg"] = torch.tensor([90.0, 45.0])
+    batch["strongest_aod_valid"] = torch.ones(2, dtype=torch.bool)
+    batch["strongest_path_index"] = torch.tensor([0, 0])
+    batch["strongest_top2_power_gap_db"] = torch.tensor([6.0, 3.0])
+    relative = model._anchor_training_payload(
+        batch, batch["strongest_aod_az_deg"]
+    )
+    assert torch.allclose(relative["aod_az_deg"][:, 0], torch.zeros(2))
+    metrics = model(batch)
+    assert torch.isfinite(metrics["loss"])
+
+    generated = model.eval().generate(
+        {
+            "total_power_db": -80.0,
+            "delay_spread_ns": 10.0,
+            "k_factor_db": 3.0,
+            "los_status": 1,
+        },
+        3,
+        strongest_aod_az_deg=38.5,
+        forced_path_count=3,
+        sampling_steps=2,
+        generator=torch.Generator().manual_seed(91),
+    )
+    final_top1 = generated["path_powers_linear"].argmax(-1)
+    final_angle = generated["aod_az_deg"].gather(
+        1, final_top1.unsqueeze(-1)
+    ).squeeze(-1)
+    final_relative = generated["strongest_anchor_relative_aod_deg"].gather(
+        1, final_top1.unsqueeze(-1)
+    ).squeeze(-1)
+    assert torch.equal(generated["strongest_anchor_path_index"], final_top1)
+    assert torch.allclose(final_angle, torch.full_like(final_angle, 38.5), atol=1e-5)
+    assert torch.allclose(final_relative, torch.zeros_like(final_relative), atol=1e-6)
+
+
+def test_aod_condition_rejects_target_for_other_condition_type() -> None:
+    config = _config()
+    config["aod_conditioning"] = {
+        "enabled": True,
+        "condition_type": "strongest",
+        "hidden_dim": 32,
+    }
+    model = MultipathDiffusionModel(
+        config,
+        SystemConfig(num_subcarriers=8, tx_array_shape=(2, 2)),
+        _stats(),
+    ).eval()
+    conditions = {
+        "total_power_db": -80.0,
+        "delay_spread_ns": 10.0,
+        "k_factor_db": 3.0,
+        "los_status": 1,
+    }
+    with pytest.raises(ValueError, match="Strongest-path AoD"):
+        model.generate(
+            conditions,
+            1,
+            mean_aod_az_deg=30.0,
+            forced_path_count=2,
+            sampling_steps=2,
+        )
 
 
 def test_paired_spatial_losses_are_zero_for_identical_csi() -> None:

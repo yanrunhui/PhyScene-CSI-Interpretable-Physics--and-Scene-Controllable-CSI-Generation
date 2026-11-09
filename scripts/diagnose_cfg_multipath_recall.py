@@ -14,7 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from physics_csi.evaluation.aod_support import circular_distance_degrees, mean_aod
+from physics_csi.evaluation.aod_support import (
+    circular_distance_degrees,
+    conditioned_aod_measurement,
+)
 from physics_csi.evaluation.multipath_recall import (
     FeatureStandardizer,
     FeatureView,
@@ -26,7 +29,7 @@ from physics_csi.training.trainer import resolve_device
 from physics_csi.utils.io import atomic_json_dump
 
 
-LABELS = ("real_query", "aod_cfg2_dp", "aod_cfg3_dp")
+LABELS = ("real_query", "aod_cfg1_dp", "aod_cfg2_dp", "aod_cfg3_dp")
 VIEWS: tuple[FeatureView, ...] = (
     "absolute",
     "target_centered",
@@ -231,7 +234,9 @@ def _comparisons(
     return output
 
 
-def _decision(comparisons: Mapping[str, Any]) -> dict[str, Any]:
+def _decision(
+    comparisons: Mapping[str, Any], *, condition_type: str
+) -> dict[str, Any]:
     absolute = comparisons["absolute"]["manifold"]["recall"]
     target_centered = comparisons["target_centered"]["manifold"]["recall"]
     self_centered = comparisons["self_centered"]["manifold"]["recall"]
@@ -258,7 +263,7 @@ def _decision(comparisons: Mapping[str, Any]) -> dict[str, Any]:
     elif lower(self_centered) or lower(without_aod):
         classification = "evidence_of_within_condition_mode_loss"
         explanation = (
-            "CFG3 remains lower after removing global Mean-AoD orientation, or even after "
+            f"CFG3 remains lower after removing global {condition_type}-AoD orientation, or even after "
             "removing AoD features; this is evidence of lost internal multipath support."
         )
     elif (
@@ -320,7 +325,10 @@ def main() -> None:
 
     device = resolve_device(args.device)
     source = torch.load(args.artifact, map_location="cpu", weights_only=False)
-    if source.get("model_kind") != "aod_conditioned_cfg_link_fidelity_comparison":
+    if source.get("model_kind") not in {
+        "aod_conditioned_cfg_link_fidelity_comparison",
+        "aod_conditioned_cfg_fidelity_comparison",
+    }:
         raise ValueError("artifact is not an AoD conditional-fidelity comparison")
     if source.get("split") != "test":
         raise ValueError("recall diagnosis must use the independent test artifact")
@@ -334,9 +342,13 @@ def main() -> None:
         for label in LABELS
     ):
         raise ValueError("CFG2, CFG3 and real payloads must be sample-aligned")
-    target = source["target_mean_aod_deg"].to(device).float()
+    condition_type = source.get("condition_type", "mean")
+    target = source.get("target_aod_deg", source.get("target_mean_aod_deg"))
+    if not isinstance(target, torch.Tensor):
+        raise ValueError("artifact has no controlled AoD target")
+    target = target.to(device).float()
     if target.shape != (sample_count,):
-        raise ValueError("target Mean AoD must align with every sample")
+        raise ValueError("target AoD must align with every sample")
 
     raw_features: dict[str, dict[FeatureView, torch.Tensor]] = {
         label: {
@@ -344,6 +356,7 @@ def main() -> None:
                 payloads[label],
                 view=view,
                 target_mean_aod_deg=target,
+                condition_type=condition_type,
             )
             for view in VIEWS
         }
@@ -360,8 +373,15 @@ def main() -> None:
         }
         for label in ("reference", *LABELS)
     }
-    reference_mean_aod, _ = mean_aod(payloads["reference"])
-    reference_angle_error = circular_distance_degrees(reference_mean_aod, target)
+    reference_aod, reference_valid, _ = conditioned_aod_measurement(
+        payloads["reference"], condition_type=condition_type
+    )
+    reference_angle_error = circular_distance_degrees(reference_aod, target)
+    reference_angle_error = torch.where(
+        reference_valid,
+        reference_angle_error,
+        torch.full_like(reference_angle_error, torch.inf),
+    )
     map_ids = payloads["reference"]["map_id"].long()
     los = payloads["real_query"]["conditions"][:, 3] >= 0.5
 
@@ -437,6 +457,7 @@ def main() -> None:
     report = {
         "format_version": 1,
         "diagnostic": "cfg2_cfg3_multipath_recall_decomposition",
+        "condition_type": condition_type,
         "artifact": str(Path(args.artifact).resolve()),
         "samples": sample_count,
         "maps": len(per_map),
@@ -445,7 +466,7 @@ def main() -> None:
                 source.get("sampling", {}).get("paired_noise_across_cfg", False)
             ),
             "condition_matching": (
-                "CFG2 and CFG3 use identical Map, physical conditions, target Mean AoD "
+                f"CFG2 and CFG3 use identical Map, physical conditions, target {condition_type} AoD "
                 "and paired noise. The independent real donor is nearby under the saved "
                 "Map-condition-AoD support protocol rather than necessarily identical."
             ),
@@ -455,7 +476,11 @@ def main() -> None:
             "feature_views": {
                 "absolute": "All link-level path parameters including absolute AoD.",
                 "target_centered": "Subtract requested Mean AoD from every path AoD.",
-                "self_centered": "Subtract each link's own power-weighted Mean AoD.",
+                "self_centered": (
+                    "Subtract each link's own power-weighted Mean AoD."
+                    if condition_type == "mean"
+                    else "Subtract each link's own final-power strongest-path AoD."
+                ),
                 "without_aod": "Remove all AoD coordinates while retaining other path parameters.",
             },
         },
@@ -470,7 +495,7 @@ def main() -> None:
         },
         "macro_per_map": macro,
         "cfg3_vs_cfg2_paired_per_map": comparisons,
-        "decision": _decision(comparisons),
+        "decision": _decision(comparisons, condition_type=condition_type),
         "by_los": by_los,
         "per_map": per_map,
         "per_map_los": per_map_los,

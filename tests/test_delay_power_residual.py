@@ -59,6 +59,17 @@ def test_dp_residual_starts_at_projected_b3_identity() -> None:
     torch.testing.assert_close(output.constrained.powers_linear, base["path_powers_linear"])
 
 
+def test_dp_reorders_tracked_strongest_anchor_index_with_paths() -> None:
+    model = _model().eval()
+    base, conditions, validity = _batch(1)
+    base["path_delays_ns"] = torch.tensor([[10.0, 0.0, 0.0]])
+    base["strongest_anchor_path_index"] = torch.tensor([0])
+    output = model(base, conditions, validity, map_id=torch.tensor([10]))
+    result = model.apply_to_payload(base, output)
+    assert output.canonical_order.tolist() == [[1, 0, 2]]
+    assert result["strongest_anchor_path_index"].tolist() == [1]
+
+
 def test_dp_distribution_loss_backpropagates_without_sample_pairing() -> None:
     model = _model().train()
     base, conditions, validity = _batch(8)

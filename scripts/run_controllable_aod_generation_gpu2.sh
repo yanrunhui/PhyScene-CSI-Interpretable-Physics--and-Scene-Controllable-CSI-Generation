@@ -8,43 +8,48 @@ cd "${PROJECT_ROOT}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 export PYTHONUNBUFFERED=1
 PYTHON_BIN="${PYTHON_BIN:-python}"
-# Frozen production policy. Research sweeps should call the Python entry point
-# directly instead of mutating these validated defaults through environment state.
-AOD_GUIDANCE_SCALE="2.0"
-CANDIDATE_MULTIPLIER="2"
-CANDIDATE_TOP_UP_SIZE="8"
-MAXIMUM_CANDIDATE_MULTIPLIER="8"
-NATURAL_TOLERANCE_DEG="10"
-B3_CHECKPOINT="${B3_CHECKPOINT:-artifacts/checkpoints/b3_seen_map_baseline/best.pt}"
-SUPPORT_CACHE="${SUPPORT_CACHE:-artifacts/generated/delay_power_residual/b3_cache_seed2026.pt}"
-if [[ -z "${AOD_CHECKPOINT:-}" ]]; then
-  AOD_CHECKPOINT="$({
-    find artifacts/checkpoints/aod_conditioned_b3 -mindepth 2 -maxdepth 2 \
-      -type f -name best.pt -print 2>/dev/null || true
-  } | sort | tail -1)"
+AOD_MODE="${AOD_MODE:-mean_power_weighted}"
+TARGET_AOD_DEG="${TARGET_AOD_DEG:-}"
+if [[ "${AOD_MODE}" != "mean_power_weighted" && "${AOD_MODE}" != "strongest_path" ]]; then
+  printf 'AOD_MODE must be mean_power_weighted or strongest_path; got %s\n' \
+    "${AOD_MODE}" >&2
+  exit 2
+fi
+if [[ -z "${TARGET_AOD_DEG}" ]]; then
+  printf 'Set TARGET_AOD_DEG to the requested angle in degrees.\n' >&2
+  exit 2
 fi
 
+latest_file() {
+  {
+    find "$1" -type f -name best.pt -printf '%T@ %p\n' 2>/dev/null || true
+  } | sort -nr | head -1 | cut -d' ' -f2-
+}
+
+if [[ -z "${MEAN_AOD_CHECKPOINT:-}" ]]; then
+  MEAN_AOD_CHECKPOINT="$(latest_file artifacts/checkpoints/aod_conditioned_b3)"
+fi
+if [[ -z "${STRONGEST_AOD_CHECKPOINT:-}" ]]; then
+  STRONGEST_AOD_CHECKPOINT="$({
+    find artifacts/strongest_aod_anchor artifacts/checkpoints/strongest_aod_anchor_b3 \
+      -type f -name best.pt -printf '%T@ %p\n' 2>/dev/null || true
+  } | sort -nr | head -1 | cut -d' ' -f2-)"
+fi
 if [[ -z "${DP_CHECKPOINT:-}" ]]; then
-  DP_CHECKPOINT="$({
-    find artifacts/checkpoints/delay_power_residual -mindepth 2 -maxdepth 2 \
-      -type f -name best.pt -print 2>/dev/null || true
-  } | sort | tail -1)"
+  DP_CHECKPOINT="$(latest_file artifacts/checkpoints/delay_power_residual)"
 fi
-if [[ -z "${LINK_CHECKPOINT:-}" ]]; then
-  LINK_CHECKPOINT="$({
-    find artifacts/checkpoints/aod_link_global_residual -mindepth 2 -maxdepth 2 \
-      -type f -name best.pt -print 2>/dev/null || true
-  } | sort | tail -1)"
-fi
-TARGET_AOD_AZ_DEG="${TARGET_AOD_AZ_DEG:-}"
-if [[ -n "${TARGET_AOD_AZ_DEG}" ]]; then
-  GENERATION_MODE="six_condition_mean_aod"
-  REQUIRED_FILES=("${AOD_CHECKPOINT}" "${DP_CHECKPOINT}" "${SUPPORT_CACHE}")
+SUPPORT_CACHE="${SUPPORT_CACHE:-artifacts/generated/delay_power_residual/b3_cache_seed2026.pt}"
+
+if [[ "${AOD_MODE}" == "mean_power_weighted" ]]; then
+  SELECTED_CHECKPOINT="${MEAN_AOD_CHECKPOINT}"
+  CFG="2"
+  OUTPUT_POLICY="fixed_16_to_8_natural_mean_filter"
 else
-  GENERATION_MODE="five_condition"
-  REQUIRED_FILES=("${B3_CHECKPOINT}" "${DP_CHECKPOINT}" "${LINK_CHECKPOINT}" "${SUPPORT_CACHE}")
+  SELECTED_CHECKPOINT="${STRONGEST_AOD_CHECKPOINT}"
+  CFG="1"
+  OUTPUT_POLICY="direct_8_dp_swap_top1_verification"
 fi
-for required in "${REQUIRED_FILES[@]}"; do
+for required in "${SELECTED_CHECKPOINT}" "${DP_CHECKPOINT}" "${SUPPORT_CACHE}"; do
   if [[ -z "${required}" || ! -f "${required}" ]]; then
     printf 'Required file not found: %s\n' "${required:-<empty>}" >&2
     exit 2
@@ -63,36 +68,25 @@ on_exit() {
   local code=$?
   if (( code == 0 )); then
     printf 'SUCCESS\n' > "${STATUS_FILE}"
-    printf '\n[%s] Controllable AoD generation completed successfully.\n' \
-      "$(date --iso-8601=seconds 2>/dev/null || date)" | tee -a "${QUEUE_LOG}"
   else
     printf 'FAILED exit_code=%s\n' "${code}" > "${STATUS_FILE}"
-    printf '\n[%s] Controllable AoD generation failed with exit code %s.\n' \
-      "$(date --iso-8601=seconds 2>/dev/null || date)" "${code}" | tee -a "${QUEUE_LOG}"
   fi
+  printf 'artifact=%s\nreport=%s\nlogs=%s\nexit_code=%s\n' \
+    "${OUTPUT}" "${REPORT}" "${LOG_DIR}" "${code}" | tee -a "${QUEUE_LOG}"
 }
 trap on_exit EXIT
 
 {
-  printf 'project_root=%s\n' "${PROJECT_ROOT}"
-  printf 'cuda_visible_devices=%s\n' "${CUDA_VISIBLE_DEVICES}"
-  printf 'map_id=%s\n' "${MAP_ID:-10}"
-  printf 'generation_mode=%s\n' "${GENERATION_MODE}"
-  printf 'b3_checkpoint=%s\n' "${B3_CHECKPOINT}"
-  printf 'aod_checkpoint=%s\n' "${AOD_CHECKPOINT:-<not found>}"
-  printf 'dp_checkpoint=%s\n' "${DP_CHECKPOINT}"
-  printf 'link_checkpoint=%s\n' "${LINK_CHECKPOINT:-<not found>}"
-  printf 'samples=%s\n' "${NUM_SAMPLES:-8}"
-  printf 'target_aod_az_deg=%s\n' "${TARGET_AOD_AZ_DEG:-<not specified>}"
-  printf 'candidate_multiplier=%s\n' "${CANDIDATE_MULTIPLIER}"
-  printf 'candidate_top_up_size=%s\n' "${CANDIDATE_TOP_UP_SIZE}"
-  printf 'maximum_candidate_multiplier=%s\n' "${MAXIMUM_CANDIDATE_MULTIPLIER}"
-  printf 'natural_tolerance_deg=%s\n' "${NATURAL_TOLERANCE_DEG}"
-  printf 'aod_guidance_scale=%s\n' "${AOD_GUIDANCE_SCALE}"
-  printf 'selection_policy=uniform_random_without_replacement\n'
-  printf 'tolerance_relaxation=disabled\n'
-  printf 'output=%s\n' "${OUTPUT}"
-  printf 'report=%s\n' "${REPORT}"
+  printf 'project_root=%s\ncuda_visible_devices=%s\n' \
+    "${PROJECT_ROOT}" "${CUDA_VISIBLE_DEVICES}"
+  printf 'aod_mode=%s\ntarget_aod_deg=%s\ncfg=%s\noutput_policy=%s\n' \
+    "${AOD_MODE}" "${TARGET_AOD_DEG}" "${CFG}" "${OUTPUT_POLICY}"
+  printf 'map_id=%s\nmean_aod_checkpoint=%s\nstrongest_anchor_checkpoint=%s\n' \
+    "${MAP_ID:-10}" "${MEAN_AOD_CHECKPOINT:-<not found>}" \
+    "${STRONGEST_AOD_CHECKPOINT:-<not found>}"
+  printf 'selected_checkpoint=%s\ndp_checkpoint=%s\nsupport_cache=%s\n' \
+    "${SELECTED_CHECKPOINT}" "${DP_CHECKPOINT}" "${SUPPORT_CACHE}"
+  printf 'output=%s\nreport=%s\n' "${OUTPUT}" "${REPORT}"
 } | tee "${QUEUE_LOG}"
 
 COMMAND=(
@@ -101,29 +95,24 @@ COMMAND=(
   --support-cache "${SUPPORT_CACHE}"
   --output "${OUTPUT}"
   --report "${REPORT}"
+  --aod-mode "${AOD_MODE}"
+  --target-aod-deg "${TARGET_AOD_DEG}"
   --map-id "${MAP_ID:-10}"
-  --num-samples "${NUM_SAMPLES:-8}"
+  --num-samples 8
   --total-power-db "${TOTAL_POWER_DB:--90}"
   --delay-spread-ns "${DELAY_SPREAD_NS:-30}"
   --k-factor-db "${K_FACTOR_DB:-0}"
   --los-status "${LOS_STATUS:-0}"
   --path-count "${PATH_COUNT:-5}"
-  --candidate-multiplier "${CANDIDATE_MULTIPLIER}"
-  --candidate-top-up-size "${CANDIDATE_TOP_UP_SIZE}"
-  --maximum-candidate-multiplier "${MAXIMUM_CANDIDATE_MULTIPLIER}"
   --candidate-generation-batch-size "${CANDIDATE_BATCH_SIZE:-512}"
-  --natural-angle-tolerance-deg "${NATURAL_TOLERANCE_DEG}"
-  --aod-guidance-scale "${AOD_GUIDANCE_SCALE}"
+  --natural-angle-tolerance-deg 10
   --seed "${SEED:-2026}"
   --device cuda
 )
-if [[ "${GENERATION_MODE}" == "five_condition" ]]; then
-  COMMAND+=(--b3-checkpoint "${B3_CHECKPOINT}" --link-checkpoint "${LINK_CHECKPOINT}")
+if [[ "${AOD_MODE}" == "mean_power_weighted" ]]; then
+  COMMAND+=(--mean-aod-checkpoint "${MEAN_AOD_CHECKPOINT}")
 else
-  COMMAND+=(--aod-checkpoint "${AOD_CHECKPOINT}" --target-aod-az-deg "${TARGET_AOD_AZ_DEG}")
+  COMMAND+=(--strongest-aod-checkpoint "${STRONGEST_AOD_CHECKPOINT}")
 fi
-"${COMMAND[@]}" \
-  2>&1 | tee "${LOG_DIR}/generation.log"
 
-printf '\nArtifact: %s\nReport: %s\nLogs: %s\n' \
-  "${OUTPUT}" "${REPORT}" "${LOG_DIR}" | tee -a "${QUEUE_LOG}"
+"${COMMAND[@]}" 2>&1 | tee "${LOG_DIR}/generation.log"

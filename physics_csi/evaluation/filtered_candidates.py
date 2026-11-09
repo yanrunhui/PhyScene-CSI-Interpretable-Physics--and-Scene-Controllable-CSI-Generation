@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Literal, Mapping
 
 import torch
 
-from physics_csi.evaluation.aod_support import circular_distance_degrees, mean_aod
+from physics_csi.evaluation.aod_support import (
+    circular_distance_degrees,
+    mean_aod,
+    strongest_aod,
+)
 from physics_csi.physics.aod_control import wrap_degrees
 
 
@@ -27,29 +31,47 @@ def select_first_eligible_candidates(
     outputs_per_query: int,
     tolerance_deg: float,
     minimum_concentration: float = 0.10,
+    mode: Literal["mean", "strongest"] = "mean",
+    exclude_strongest_near_ties: bool = False,
+    strongest_near_tie_gap_db: float = 0.5,
 ) -> FilteredCandidateSelection:
-    """Select accepted candidates in generation order without error ranking."""
+    """Select natural Mean or Strongest AoD candidates in generation order."""
     if queries < 1 or candidates_per_query < 1 or outputs_per_query < 1:
         raise ValueError("query, candidate and output counts must be positive")
     if outputs_per_query > candidates_per_query:
         raise ValueError("outputs_per_query cannot exceed candidates_per_query")
     if not 0.0 <= tolerance_deg <= 180.0:
         raise ValueError("tolerance_deg must lie in [0, 180]")
+    if not 0.0 <= minimum_concentration <= 1.0:
+        raise ValueError("minimum_concentration must lie in [0, 1]")
+    if mode not in {"mean", "strongest"}:
+        raise ValueError("mode must be 'mean' or 'strongest'")
+    if strongest_near_tie_gap_db < 0.0:
+        raise ValueError("strongest_near_tie_gap_db must be non-negative")
     samples = int(payload["path_mask"].shape[0])
     if samples != queries * candidates_per_query:
         raise ValueError("payload size does not match query and candidate counts")
     target = target_mean_aod_deg.to(payload["aod_az_deg"]).reshape(-1)
     if target.shape != (queries,):
-        raise ValueError("target Mean AoD must have shape [queries]")
+        raise ValueError("target AoD must have shape [queries]")
 
-    actual, concentration = mean_aod(payload)
+    if mode == "mean":
+        actual, concentration = mean_aod(payload)
+        measurement_valid = concentration >= minimum_concentration
+    else:
+        measured = strongest_aod(
+            payload, near_tie_gap_db=strongest_near_tie_gap_db
+        )
+        actual = measured.angle_deg
+        measurement_valid = measured.valid
+        if exclude_strongest_near_ties:
+            measurement_valid = measurement_valid & ~measured.near_tie
     expanded_target = target.repeat_interleave(candidates_per_query)
     error = circular_distance_degrees(actual, expanded_target).reshape(
         queries, candidates_per_query
     )
-    eligible = (error <= tolerance_deg) & (
-        concentration.reshape(queries, candidates_per_query)
-        >= minimum_concentration
+    eligible = (error <= tolerance_deg) & measurement_valid.reshape(
+        queries, candidates_per_query
     )
     eligible_count = eligible.sum(-1)
     success = eligible_count >= outputs_per_query

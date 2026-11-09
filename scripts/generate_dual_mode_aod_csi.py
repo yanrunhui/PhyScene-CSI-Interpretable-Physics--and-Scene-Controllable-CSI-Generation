@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 import time
@@ -15,16 +14,21 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from physics_csi.generation_mode import CandidateBudgetPolicy, resolve_generation_route
+from physics_csi.generation_mode import AoDControlMode, resolve_generation_route
+from physics_csi.evaluation.aod_support import (
+    circular_distance_degrees,
+    conditioned_aod_measurement,
+    enforce_final_strongest_anchor,
+    normalized_condition_features,
+    strongest_aod,
+)
 from physics_csi.models.diffusion.multipath_diffusion import MultipathDiffusionModel
 from physics_csi.models.scene_delay_power_residual import SceneConditionedDelayPowerResidual
-from physics_csi.models.scene_link_global_aod_residual import (
-    SceneConditionedLinkGlobalAoDResidual,
-)
 from physics_csi.physics.aod_control import (
     AoDControlProjector,
     select_payload_samples,
     select_random_aod_candidates_within_tolerance,
+    wrap_degrees,
 )
 from physics_csi.physics.constraints import check_condition_feasibility
 from physics_csi.physics.synthesizer import MIMOOFDMSynthesizer, SystemConfig
@@ -60,14 +64,6 @@ def _to_device(
     return {key: value.to(device) for key, value in payload.items()}
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _map_id(value: str) -> int:
     normalized = value.strip().lower()
     if normalized.startswith("map_"):
@@ -93,6 +89,40 @@ def _synthesize(
     )
 
 
+def _refresh_strongest_aod_fields(
+    payload: Mapping[str, torch.Tensor],
+    target_az_deg: float | torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Recompute every Strongest-AoD derivative after a power-changing stage."""
+    result = {
+        key: value for key, value in payload.items() if isinstance(value, torch.Tensor)
+    }
+    measured = strongest_aod(result)
+    target = torch.as_tensor(
+        target_az_deg,
+        device=measured.angle_deg.device,
+        dtype=measured.angle_deg.dtype,
+    ).reshape(-1)
+    if target.numel() == 1:
+        target = target.expand(measured.angle_deg.shape[0])
+    if target.shape != measured.angle_deg.shape:
+        raise ValueError("Strongest-AoD target must be scalar or match payload size")
+    target = wrap_degrees(target)
+    result.update(
+        target_strongest_aod_az_deg=target,
+        target_strongest_aod_validity=torch.ones_like(target, dtype=torch.bool),
+        actual_strongest_aod_az_deg=measured.angle_deg,
+        actual_strongest_path_index=measured.path_index,
+        actual_strongest_aod_valid=measured.valid,
+        strongest_top2_power_gap_db=measured.top2_power_gap_db,
+        strongest_near_tie=measured.near_tie,
+        strongest_aod_circular_error_deg=circular_distance_degrees(
+            measured.angle_deg, target
+        ),
+    )
+    return result
+
+
 def _audit(values: torch.Tensor) -> dict[str, float]:
     values = values.detach().float().flatten()
     return {
@@ -102,52 +132,6 @@ def _audit(values: torch.Tensor) -> dict[str, float]:
         "p99": float(torch.quantile(values, 0.99)),
         "maximum": float(values.max()),
     }
-
-
-def _load_models(
-    b3_path: Path,
-    dp_path: Path,
-    link_path: Path,
-    device: torch.device,
-) -> tuple[
-    MultipathDiffusionModel,
-    SceneConditionedDelayPowerResidual,
-    SceneConditionedLinkGlobalAoDResidual,
-    Mapping[str, Any],
-]:
-    b3_checkpoint = torch.load(b3_path, map_location="cpu", weights_only=False)
-    dp_checkpoint = torch.load(dp_path, map_location="cpu", weights_only=False)
-    link_checkpoint = torch.load(link_path, map_location="cpu", weights_only=False)
-    if dp_checkpoint.get("model_kind") != "scene_delay_power_residual":
-        raise ValueError("--dp-checkpoint is not a DP residual")
-    if link_checkpoint.get("model_kind") != "scene_link_global_aod_residual":
-        raise ValueError("--link-checkpoint is not a Link-global AoD residual")
-    fingerprint = _sha256(b3_path)
-    for checkpoint in (dp_checkpoint, link_checkpoint):
-        if checkpoint["cache_contract"]["b3_checkpoint_sha256"] != fingerprint:
-            raise ValueError("residual checkpoint was trained with a different B3 backbone")
-    config = b3_checkpoint["config"]
-    system = SystemConfig.from_mapping(config["data"]["system"])
-    b3 = MultipathDiffusionModel(
-        config["multipath_diffusion"], system, b3_checkpoint["statistics"]
-    ).to(device)
-    if b3.scene_aware_enabled:
-        raise ValueError("dual-mode pipeline requires the Map-independent B3 backbone")
-    b3.load_state_dict(
-        b3_checkpoint.get("ema_state_dict", b3_checkpoint["model_state_dict"])
-    )
-    b3.requires_grad_(False).eval()
-    dp = SceneConditionedDelayPowerResidual(**dp_checkpoint["model_init"]).to(device)
-    dp.load_state_dict(dp_checkpoint.get("ema_state_dict", dp_checkpoint["model_state_dict"]))
-    dp.requires_grad_(False).eval()
-    link = SceneConditionedLinkGlobalAoDResidual(**link_checkpoint["model_init"]).to(device)
-    link.load_state_dict(
-        link_checkpoint.get("ema_state_dict", link_checkpoint["model_state_dict"])
-    )
-    link.requires_grad_(False).eval()
-    if dp.map_id_to_index != link.map_id_to_index:
-        raise ValueError("DP and Link-global checkpoints use different Map mappings")
-    return b3, dp, link, b3_checkpoint
 
 
 def _load_dp_model(
@@ -167,15 +151,29 @@ def _load_aod_conditioned_model(
     checkpoint_path: Path,
     dp: SceneConditionedDelayPowerResidual,
     device: torch.device,
+    expected_condition_type: str,
 ) -> tuple[MultipathDiffusionModel, Mapping[str, Any], int]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if checkpoint.get("model_kind") != "multipath_diffusion_scene_id_aod_conditioned":
+    expected_kinds = {
+        "mean": {"multipath_diffusion_scene_id_aod_conditioned"},
+        "strongest": {"multipath_diffusion_scene_id_strongest_aod_anchor"},
+    }[expected_condition_type]
+    if checkpoint.get("model_kind") not in expected_kinds:
         raise ValueError("--aod-checkpoint is not an AoD-conditioned B3 checkpoint")
     config = checkpoint["config"]
-    if not config["multipath_diffusion"].get("aod_conditioning", {}).get(
-        "enabled", False
-    ):
-        raise ValueError("--aod-checkpoint does not enable Mean-AoD conditioning")
+    aod_config = config["multipath_diffusion"].get("aod_conditioning", {})
+    if not aod_config.get("enabled", False):
+        raise ValueError("--aod-checkpoint does not enable AoD conditioning")
+    condition_type = str(aod_config.get("condition_type", "mean"))
+    if condition_type != expected_condition_type:
+        raise ValueError(
+            "--aod-checkpoint condition type does not match the requested AoD target"
+        )
+    anchor_enabled = bool(
+        aod_config.get("anchor_parameterization", {}).get("enabled", False)
+    )
+    if expected_condition_type == "strongest" and not anchor_enabled:
+        raise ValueError("Strongest production mode requires a Strongest Anchor checkpoint")
     trained_path_count = config.get("aod_conditioned_data", {}).get("path_count")
     if trained_path_count is None:
         raise ValueError("AoD checkpoint does not record its trained path count")
@@ -201,6 +199,8 @@ def _support_audit(
     conditions: torch.Tensor,
     validity: torch.Tensor,
     path_count: int,
+    target_aod_deg: float,
+    condition_type: str,
 ) -> dict[str, Any] | None:
     if cache_path is None:
         return None
@@ -218,30 +218,57 @@ def _support_audit(
         & ((values[:, 3] >= 0.5) == (conditions[0, 3] >= 0.5))
         & (valid[:, 2] == validity[0, 2])
     )
-    candidates = torch.nonzero(exact, as_tuple=False).flatten()
-    if not candidates.numel():
-        return {
-            "status": "out_of_support",
-            "exact_structural_candidates": 0,
-            "map_id": map_id,
-            "path_count": path_count,
-        }
-    scale = values.std(0, unbiased=False).clamp_min(1e-6)
-    dimensions = torch.tensor([0, 1, 2]) if bool(validity[0, 2]) else torch.tensor([0, 1])
-    distance = (
-        (values[candidates][:, dimensions] - conditions[0, dimensions])
-        / scale[dimensions]
-    ).square().sum(-1).sqrt()
-    nearest = float(distance.min())
-    within_one = int((distance <= 1.0).sum())
-    within_two = int((distance <= 2.0).sum())
-    status = "supported" if within_one >= 12 else "low_support" if within_two >= 12 else "out_of_support"
+    condition_std = torch.as_tensor(
+        cache.get("b3_statistics", {}).get("condition_std", []),
+        dtype=torch.float32,
+    )
+    if condition_std.numel() != 4:
+        condition_std = values.std(0, unbiased=False).clamp_min(1e-6)
+    real_features = normalized_condition_features(values, valid, condition_std)
+    request_features = normalized_condition_features(
+        conditions[:1].float(), validity[:1].bool(), condition_std
+    )
+    condition_distance = torch.linalg.vector_norm(
+        real_features - request_features[0], dim=-1
+    )
+    real_angle, real_angle_valid, _ = conditioned_aod_measurement(
+        reference, condition_type=condition_type
+    )
+    angle_distance = circular_distance_degrees(
+        real_angle, torch.tensor(float(target_aod_deg))
+    )
+    joint = (
+        exact
+        & real_angle_valid
+        & (condition_distance <= 1.5)
+        & (angle_distance <= 10.0)
+    )
+    cross_scene = (
+        (maps != map_id)
+        & (count == path_count)
+        & ((values[:, 3] >= 0.5) == (conditions[0, 3] >= 0.5))
+        & (valid[:, 2] == validity[0, 2])
+        & real_angle_valid
+        & (condition_distance <= 1.5)
+        & (angle_distance <= 10.0)
+    )
+    support_count = int(joint.sum())
+    structural_count = int(exact.sum())
     return {
-        "status": status,
-        "exact_structural_candidates": int(candidates.numel()),
-        "standardized_condition_distance_minimum": nearest,
-        "neighbors_within_1": within_one,
-        "neighbors_within_2": within_two,
+        "support_class": "A" if support_count >= 8 else "B",
+        "interpretation": (
+            "A: Map-conditioned real support; B: low Map support but the declared "
+            "aggregate physical conditions are feasible. Known link geometry is not "
+            "available here, so this audit does not declare class C conflicts."
+        ),
+        "aod_semantics": condition_type,
+        "target_aod_deg": float(target_aod_deg),
+        "map_joint_support_count": support_count,
+        "cross_scene_joint_support_count": int(cross_scene.sum()),
+        "minimum_support_for_class_a": 8,
+        "maximum_standardized_condition_distance": 1.5,
+        "maximum_circular_angle_distance_deg": 10.0,
+        "exact_structural_candidates": structural_count,
         "map_id": map_id,
         "path_count": path_count,
     }
@@ -250,15 +277,13 @@ def _support_audit(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate CSI through one of two frozen routes: B3+DP+Link-global "
-            "without a Mean-AoD request, or AoD-B3(CFG=2)+DP with bounded "
-            "natural-angle candidate filtering when Mean AoD is set."
+            "Generate CSI through one of two frozen AoD semantics: power-weighted "
+            "Mean AoD or Strongest-path AoD."
         )
     )
-    parser.add_argument("--b3-checkpoint")
-    parser.add_argument("--aod-checkpoint")
+    parser.add_argument("--mean-aod-checkpoint")
+    parser.add_argument("--strongest-aod-checkpoint")
     parser.add_argument("--dp-checkpoint", required=True)
-    parser.add_argument("--link-checkpoint")
     parser.add_argument("--output", required=True)
     parser.add_argument("--report")
     parser.add_argument("--support-cache")
@@ -270,34 +295,13 @@ def main() -> None:
     parser.add_argument("--los-status", type=int, choices=[0, 1], required=True)
     parser.add_argument("--path-count", type=int, required=True)
     parser.add_argument(
-        "--target-aod-az-deg",
-        type=float,
-        help=(
-            "Power-weighted Mean AoD target. Omitting it selects five-condition mode; "
-            "supplying it selects the AoD-conditioned six-condition route."
-        ),
+        "--aod-mode",
+        required=True,
+        choices=[mode.value for mode in AoDControlMode],
     )
-    parser.add_argument("--aod-guidance-scale", type=float, default=2.0)
-    parser.add_argument(
-        "--disable-aod-filter",
-        action="store_true",
-        help="Return direct AoD-B3 samples without the default natural ±tolerance filter.",
-    )
+    parser.add_argument("--target-aod-deg", type=float, required=True)
     parser.add_argument("--natural-angle-tolerance-deg", type=float, default=10.0)
     parser.add_argument("--minimum-mean-concentration", type=float, default=0.10)
-    parser.add_argument("--candidate-multiplier", type=int, default=2)
-    parser.add_argument(
-        "--candidate-top-up-size",
-        type=int,
-        default=8,
-        help="Additional candidates generated per retry when fewer than requested pass.",
-    )
-    parser.add_argument(
-        "--maximum-candidate-multiplier",
-        type=int,
-        default=8,
-        help="Hard candidate budget relative to the requested output count.",
-    )
     parser.add_argument("--candidate-generation-batch-size", type=int, default=512)
     parser.add_argument(
         "--selection-seed",
@@ -313,67 +317,47 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--sampler", choices=["ddpm", "ddim"])
     parser.add_argument("--sampling-steps", type=int)
-    parser.add_argument(
-        "--guidance-scale",
-        type=float,
-        help="Optional guidance override for five-condition B3 only.",
-    )
     args = parser.parse_args()
 
-    if args.num_samples < 1:
-        parser.error("num-samples must be positive")
-    if args.candidate_multiplier < 1:
-        parser.error("candidate-multiplier must be positive")
-    if args.candidate_top_up_size < 1:
-        parser.error("candidate-top-up-size must be positive")
-    if args.maximum_candidate_multiplier < args.candidate_multiplier:
-        parser.error(
-            "maximum-candidate-multiplier cannot be smaller than candidate-multiplier"
-        )
+    if args.num_samples != 8:
+        parser.error("the frozen production contract outputs exactly 8 CSI samples")
     if args.candidate_generation_batch_size < 1:
         parser.error("candidate-generation-batch-size must be positive")
     if not 0.0 <= args.natural_angle_tolerance_deg <= 180.0:
         parser.error("natural-angle-tolerance-deg must lie in [0, 180]")
+    if args.natural_angle_tolerance_deg != 10.0:
+        parser.error("the frozen production tolerance is exactly 10 degrees")
 
     device = resolve_device(args.device)
     dp, _ = _load_dp_model(Path(args.dp_checkpoint), device)
-    aod_model: MultipathDiffusionModel | None = None
-    natural_b3: MultipathDiffusionModel | None = None
-    link: SceneConditionedLinkGlobalAoDResidual | None = None
-    checkpoint: Mapping[str, Any]
-    trained_aod_path_count = 5
-
-    if args.target_aod_az_deg is None:
-        if not args.b3_checkpoint or not args.link_checkpoint:
-            parser.error(
-                "five-condition mode requires --b3-checkpoint and --link-checkpoint"
-            )
-        natural_b3, dp, link, checkpoint = _load_models(
-            Path(args.b3_checkpoint),
-            Path(args.dp_checkpoint),
-            Path(args.link_checkpoint),
-            device,
-        )
-    else:
-        if not args.aod_checkpoint:
-            parser.error("six-condition Mean-AoD mode requires --aod-checkpoint")
-        aod_model, checkpoint, trained_aod_path_count = _load_aod_conditioned_model(
-            Path(args.aod_checkpoint), dp, device
-        )
+    requested_mode = AoDControlMode(args.aod_mode)
+    requested_condition_type = (
+        "mean"
+        if requested_mode is AoDControlMode.MEAN_POWER_WEIGHTED
+        else "strongest"
+    )
+    checkpoint_argument = (
+        args.mean_aod_checkpoint
+        if requested_mode is AoDControlMode.MEAN_POWER_WEIGHTED
+        else args.strongest_aod_checkpoint
+    )
+    if not checkpoint_argument:
+        parser.error(f"{args.aod_mode} requires its corresponding checkpoint")
+    aod_model, checkpoint, trained_aod_path_count = _load_aod_conditioned_model(
+        Path(checkpoint_argument), dp, device, requested_condition_type
+    )
 
     try:
         route = resolve_generation_route(
-            target_mean_aod_az_deg=args.target_aod_az_deg,
+            aod_mode=requested_mode,
+            target_aod_deg=args.target_aod_deg,
             path_count=args.path_count,
             aod_trained_path_count=trained_aod_path_count,
-            aod_guidance_scale=args.aod_guidance_scale,
         )
     except ValueError as error:
         parser.error(str(error))
 
-    active_model = natural_b3 if route.use_natural_b3 else aod_model
-    if active_model is None:
-        raise RuntimeError("generation route did not load its required backbone")
+    active_model = aod_model
     if not 1 <= args.path_count <= active_model.max_paths:
         parser.error(f"path-count must lie in [1, {active_model.max_paths}]")
 
@@ -392,16 +376,8 @@ def main() -> None:
         condition_dict, path_count=args.path_count, k_factor_valid=k_valid
     )
 
-    apply_filter = route.use_aod_conditioned_b3 and not args.disable_aod_filter
-    candidate_policy = CandidateBudgetPolicy(
-        requested_outputs=args.num_samples,
-        initial_multiplier=args.candidate_multiplier,
-        top_up_candidates=args.candidate_top_up_size,
-        maximum_multiplier=args.maximum_candidate_multiplier,
-    )
-    maximum_candidate_samples = (
-        candidate_policy.maximum_candidates if apply_filter else args.num_samples
-    )
+    apply_filter = route.apply_natural_angle_filter
+    maximum_candidate_samples = args.num_samples * route.candidate_multiplier
     condition_row = torch.tensor(
         [args.total_power_db, args.delay_spread_ns, args.k_factor_db, args.los_status],
         dtype=torch.float32,
@@ -421,15 +397,7 @@ def main() -> None:
 
     with torch.inference_mode():
         while candidate_samples < maximum_candidate_samples:
-            if apply_filter and eligible_candidate_samples >= args.num_samples:
-                break
-            round_size = (
-                candidate_policy.next_round_size(candidate_samples)
-                if apply_filter
-                else args.num_samples
-            )
-            if round_size == 0:
-                break
+            round_size = maximum_candidate_samples - candidate_samples
             generation_round_sizes.append(round_size)
             round_complete = 0
             while round_complete < round_size:
@@ -445,65 +413,46 @@ def main() -> None:
                 )
                 map_index = dp.map_indices(map_ids)
 
-                if route.use_natural_b3:
-                    assert natural_b3 is not None and link is not None
-                    if not torch.equal(map_index, link.map_indices(map_ids)):
-                        raise RuntimeError(
-                            "DP and Link-global resolved the Map ID differently"
-                        )
-                    base_batch = natural_b3.generate(
-                        conditions,
-                        batch_size,
-                        condition_validity=validity,
-                        sampler=args.sampler or str(sampling["sampler"]),
-                        sampling_steps=args.sampling_steps
-                        or int(sampling["sampling_steps"]),
-                        eta=float(sampling.get("eta", 0.0)),
-                        guidance_scale=(
-                            args.guidance_scale
-                            if args.guidance_scale is not None
-                            else float(sampling["guidance_scale"])
-                        ),
-                        forced_path_count=args.path_count,
-                        generator=generator,
-                    )
-                else:
-                    assert (
-                        aod_model is not None
-                        and route.target_mean_aod_az_deg is not None
-                    )
-                    base_batch = aod_model.generate(
-                        conditions,
-                        batch_size,
-                        condition_validity=validity,
-                        sampler=args.sampler or str(sampling["sampler"]),
-                        sampling_steps=args.sampling_steps
-                        or int(sampling["sampling_steps"]),
-                        eta=float(sampling.get("eta", 0.0)),
-                        guidance_scale=float(route.guidance_scale),
-                        forced_path_count=args.path_count,
-                        mean_aod_az_deg=route.target_mean_aod_az_deg,
-                        map_id=map_ids,
-                        generator=generator,
-                    )
+                base_batch = aod_model.generate(
+                    conditions,
+                    batch_size,
+                    condition_validity=validity,
+                    sampler=args.sampler or str(sampling["sampler"]),
+                    sampling_steps=args.sampling_steps
+                    or int(sampling["sampling_steps"]),
+                    eta=float(sampling.get("eta", 0.0)),
+                    guidance_scale=float(route.guidance_scale),
+                    forced_path_count=args.path_count,
+                    mean_aod_az_deg=route.target_mean_aod_az_deg,
+                    strongest_aod_az_deg=route.target_strongest_aod_az_deg,
+                    map_id=map_ids,
+                    generator=generator,
+                )
 
                 dp_output = dp(base_batch, conditions, validity, map_index=map_index)
                 dp_batch = dp.apply_to_payload(base_batch, dp_output)
-                if route.use_link_global_aod:
-                    assert link is not None
-                    link_output = link(
-                        dp_batch, conditions, validity, map_index=map_index
+                if route.aod_condition_type == "strongest":
+                    assert route.target_strongest_aod_az_deg is not None
+                    target = torch.full(
+                        (batch_size,),
+                        route.target_strongest_aod_az_deg,
+                        device=device,
                     )
-                    final_batch = link.apply_to_payload(dp_batch, link_output)
-                else:
-                    final_batch = dp_batch
+                    dp_batch = enforce_final_strongest_anchor(
+                        dp_batch,
+                        target,
+                        strategy=route.strongest_rebind_strategy or "swap",
+                    )
+                    dp_batch = _refresh_strongest_aod_fields(
+                        dp_batch, route.target_strongest_aod_az_deg
+                    )
+                final_batch = dp_batch
 
                 if apply_filter:
-                    assert route.target_mean_aod_az_deg is not None
                     measurement = projector(
                         final_batch,
-                        route.target_mean_aod_az_deg,
-                        mode="mean",
+                        route.target_aod_az_deg,
+                        mode=route.aod_condition_type,
                     )
                     eligible_candidate_samples += int(
                         (
@@ -534,9 +483,6 @@ def main() -> None:
                     ),
                     flush=True,
                 )
-            if not apply_filter:
-                break
-
         if apply_filter and eligible_candidate_samples < args.num_samples:
             report_path = (
                 Path(args.report)
@@ -544,8 +490,8 @@ def main() -> None:
                 else Path(args.output).with_suffix(".json")
             )
             failure_report = {
-                "format_version": 3,
-                "experiment": "dual_route_physics_controllable_csi_generation",
+                "format_version": 4,
+                "experiment": "dual_aod_semantics_csi_generation",
                 "status": "insufficient_eligible_candidates",
                 "generation_mode": route.mode.value,
                 "guidance_scale": route.guidance_scale,
@@ -562,16 +508,16 @@ def main() -> None:
                 "map_id": args.map_id,
                 "path_count": args.path_count,
                 "target_mean_aod_az_deg": route.target_mean_aod_az_deg,
+                "target_strongest_aod_az_deg": route.target_strongest_aod_az_deg,
                 "message": (
-                    "Maximum candidate budget was exhausted without enough "
+                    "The fixed 16-candidate Mean-AoD budget did not contain eight "
                     "naturally eligible CSI; no output artifact was written."
                 ),
             }
             atomic_json_dump(failure_report, report_path)
             print(json.dumps(failure_report, indent=2, sort_keys=True), flush=True)
             raise RuntimeError(
-                "insufficient naturally eligible Mean-AoD candidates at the "
-                "configured maximum budget"
+                "fixed Mean-AoD 16-to-8 policy has insufficient eligible candidates"
             )
 
         base = _finish_payload(base_chunks)
@@ -590,10 +536,10 @@ def main() -> None:
             )
             selection = select_random_aod_candidates_within_tolerance(
                 final_payload,
-                route.target_mean_aod_az_deg,
+                route.target_aod_az_deg,
                 samples=args.num_samples,
                 tolerance_deg=args.natural_angle_tolerance_deg,
-                mode="mean",
+                mode=route.aod_condition_type,
                 projector=projector,
                 generator=torch.Generator().manual_seed(selection_seed),
             )
@@ -601,16 +547,16 @@ def main() -> None:
             dp_payload = select_payload_samples(dp_payload, selection.indices)
             final_payload = select_payload_samples(final_payload, selection.indices)
             selection_report = {
-                "policy": "uniform_random_among_natural_mean_aod_eligible",
+                "policy": (
+                    f"uniform_random_among_natural_{route.aod_condition_type}_aod_eligible"
+                ),
                 "candidate_samples": selection.candidate_samples,
                 "eligible_samples": selection.eligible_samples,
                 "acceptance_rate": selection.eligible_samples
                 / selection.candidate_samples,
                 "selected_samples": selection.requested_samples,
                 "unique_selected_samples": int(torch.unique(selection.indices).numel()),
-                "candidate_multiplier": args.candidate_multiplier,
-                "candidate_top_up_size": args.candidate_top_up_size,
-                "maximum_candidate_multiplier": args.maximum_candidate_multiplier,
+                "candidate_multiplier": route.candidate_multiplier,
                 "maximum_candidate_budget": maximum_candidate_samples,
                 "candidate_generation_round_sizes": generation_round_sizes,
                 "natural_angle_tolerance_deg": args.natural_angle_tolerance_deg,
@@ -618,6 +564,15 @@ def main() -> None:
                 "selection_seed": selection_seed,
                 "selected_angle_error_deg": _audit(selection.angular_distance_deg),
                 "selected_candidate_indices": selection.indices.cpu().tolist(),
+            }
+        else:
+            selection_report = {
+                "policy": "direct_8_after_dp_swap_and_top1_verification",
+                "candidate_samples": candidate_samples,
+                "selected_samples": args.num_samples,
+                "candidate_multiplier": route.candidate_multiplier,
+                "strongest_rebind_strategy": route.strongest_rebind_strategy,
+                "natural_angle_tolerance_deg": args.natural_angle_tolerance_deg,
             }
 
         synthesizer = MIMOOFDMSynthesizer(active_model.synthesizer.config).to(device).eval()
@@ -630,22 +585,30 @@ def main() -> None:
 
         control_report: dict[str, Any] | None = None
         control_tensors: dict[str, torch.Tensor] | None = None
-        if route.target_mean_aod_az_deg is not None:
-            measurement = AoDControlProjector(
-                minimum_mean_concentration=args.minimum_mean_concentration
-            )(final_device, route.target_mean_aod_az_deg, mode="mean")
-            error = measurement.rotation_deg.abs()
-            control_report = {
+        measurement = AoDControlProjector(
+            minimum_mean_concentration=args.minimum_mean_concentration
+        )(
+            final_device,
+            route.target_aod_az_deg,
+            mode=route.aod_condition_type,
+        )
+        error = measurement.rotation_deg.abs()
+        control_report = {
                 "target_mean_aod_az_deg": route.target_mean_aod_az_deg,
+                "target_strongest_aod_az_deg": route.target_strongest_aod_az_deg,
+                "aod_mode": route.aod_mode.value,
+                "condition_type": route.aod_condition_type,
                 "projection_applied": False,
-                "mean_aod_error_deg": _audit(error),
+                "aod_error_deg": _audit(error),
                 "hit_at_5_deg": float((error <= 5.0).float().mean()),
                 "hit_at_10_deg": float((error <= 10.0).float().mean()),
                 "valid_rate": float(measurement.control_valid.float().mean()),
-                "mean_resultant_concentration": _audit(
-                    measurement.mean_resultant_concentration
-                ),
-            }
+        }
+        if route.aod_condition_type == "mean":
+            control_report["mean_aod_error_deg"] = control_report["aod_error_deg"]
+            control_report["mean_resultant_concentration"] = _audit(
+                measurement.mean_resultant_concentration
+            )
             control_tensors = {
                 "target_mean_aod_az_deg": measurement.target_az_deg,
                 "actual_mean_aod_az_deg": measurement.reference_before_deg,
@@ -653,6 +616,45 @@ def main() -> None:
                 "mean_aod_valid": measurement.control_valid,
                 "mean_aod_concentration": measurement.mean_resultant_concentration,
             }
+        else:
+            strongest = strongest_aod(final_device)
+            top1_pass = measurement.control_valid & (
+                error <= args.natural_angle_tolerance_deg
+            )
+            control_report.update(
+                strongest_aod_error_deg=control_report["aod_error_deg"],
+                strongest_top2_power_gap_db=_audit(strongest.top2_power_gap_db),
+                strongest_near_tie_rate=float(strongest.near_tie.float().mean()),
+                top1_verification_pass=bool(top1_pass.all()),
+            )
+            selection_report["top1_verified_samples"] = int(top1_pass.sum())
+            selection_report["top1_verification_pass"] = bool(top1_pass.all())
+            control_tensors = {
+                "target_strongest_aod_az_deg": measurement.target_az_deg,
+                "actual_strongest_aod_az_deg": strongest.angle_deg,
+                "actual_strongest_path_index": strongest.path_index,
+                "strongest_aod_circular_error_deg": error,
+                "strongest_aod_valid": strongest.valid,
+                "strongest_top2_power_gap_db": strongest.top2_power_gap_db,
+                "strongest_near_tie": strongest.near_tie,
+            }
+            if not bool(top1_pass.all()):
+                report_path = (
+                    Path(args.report)
+                    if args.report
+                    else Path(args.output).with_suffix(".json")
+                )
+                failure_report = {
+                    "format_version": 4,
+                    "experiment": "dual_aod_semantics_csi_generation",
+                    "status": "strongest_top1_verification_failed",
+                    "aod_mode": route.aod_mode.value,
+                    "control": control_report,
+                    "selection": selection_report,
+                    "message": "No output artifact was written.",
+                }
+                atomic_json_dump(failure_report, report_path)
+                raise RuntimeError("Strongest-path Top1 verification failed")
 
     elapsed = time.perf_counter() - started
     output_conditions = condition_row.expand(args.num_samples, -1).clone()
@@ -664,49 +666,54 @@ def main() -> None:
         conditions=output_conditions,
         validity=output_validity,
         path_count=args.path_count,
+        target_aod_deg=route.target_aod_az_deg,
+        condition_type=route.aod_condition_type,
     )
-    pipeline = (
-        ["B3", "DP Residual", "Link-global AoD", "physics check", "CSI synthesis"]
-        if route.use_natural_b3
-        else [
-            f"AoD-conditioned B3 (CFG={route.guidance_scale:g})",
-            "DP Residual",
-            (
-                "bounded candidate top-up + natural Mean-AoD tolerance filter "
-                "+ uniform eligible sampling"
-                if apply_filter
-                else "no AoD filter"
-            ),
-            "physics check",
-            "CSI synthesis",
-        ]
-    )
+    pipeline = [
+        f"{route.aod_mode.value} B3 (CFG={route.guidance_scale:g})",
+        "DP Residual",
+        (
+            "fixed 16-to-8 natural Mean-AoD tolerance filter"
+            if apply_filter
+            else "AoD Swap on DP Top1 change + final Top1 verification"
+        ),
+        "physics check",
+        "CSI synthesis",
+    ]
     checkpoint_paths = {
         "dp": str(Path(args.dp_checkpoint).resolve()),
-        "b3": str(Path(args.b3_checkpoint).resolve()) if args.b3_checkpoint else None,
-        "aod_conditioned_b3": (
-            str(Path(args.aod_checkpoint).resolve()) if args.aod_checkpoint else None
+        "mean_aod_b3": (
+            str(Path(args.mean_aod_checkpoint).resolve())
+            if args.mean_aod_checkpoint
+            else None
         ),
-        "link_global": (
-            str(Path(args.link_checkpoint).resolve()) if args.link_checkpoint else None
+        "strongest_anchor_b3": (
+            str(Path(args.strongest_aod_checkpoint).resolve())
+            if args.strongest_aod_checkpoint
+            else None
         ),
+        "selected_aod_b3": str(Path(checkpoint_argument).resolve()),
+        "link_global": None,
     }
     artifact = {
-        "format_version": 3,
+        "format_version": 4,
         "model_kind": "dual_route_physics_controllable_csi_generator",
         "generation_mode": route.mode.value,
+        "aod_mode": route.aod_mode.value,
         "pipeline": pipeline,
         "conditions": condition_dict,
         "condition_validity": output_validity[0],
         "map_id": args.map_id,
         "path_count": args.path_count,
         "target_mean_aod_az_deg": route.target_mean_aod_az_deg,
+        "target_strongest_aod_az_deg": route.target_strongest_aod_az_deg,
         "seed": args.seed,
         "base": _cpu(base),
         "dp_only": _cpu(dp_payload),
         "generated": _cpu(final_payload),
         "control_audit": _cpu(control_tensors),
         "selection_audit": selection_report,
+        "aod_condition_support": support,
         "checkpoint_paths": checkpoint_paths,
     }
     output = Path(args.output)
@@ -716,11 +723,12 @@ def main() -> None:
     temporary.replace(output)
 
     report = {
-        "format_version": 3,
-        "experiment": "dual_route_physics_controllable_csi_generation",
+        "format_version": 4,
+        "experiment": "dual_aod_semantics_csi_generation",
         "status": "success",
         "artifact": str(output.resolve()),
         "generation_mode": route.mode.value,
+        "aod_mode": route.aod_mode.value,
         "pipeline": pipeline,
         "samples": args.num_samples,
         "candidate_samples": candidate_samples,
@@ -732,19 +740,14 @@ def main() -> None:
         "path_count": args.path_count,
         "selection": selection_report,
         "control": control_report,
-        "scene_condition_support": support,
+        "aod_condition_support": support,
         "checkpoint_paths": checkpoint_paths,
-        "limitations": (
-            [
-                "Mean-AoD mode is currently trained and validated only for L=5.",
-                "Natural tolerance filtering enforces output tolerance without angle rotation.",
-                "Eligible candidates are sampled uniformly without replacement, not ranked by angular error.",
-                "Candidate top-up is bounded and never relaxes the requested angle tolerance.",
-                "Low-support Map-condition-angle requests remain extrapolations.",
-            ]
-            if route.use_aod_conditioned_b3
-            else []
-        ),
+        "limitations": [
+            "Both AoD modes are currently trained and validated only for L=5.",
+            "Mean mode uses a fixed 16-candidate budget and never relaxes ±10 degrees.",
+            "Strongest mode requires the Anchor checkpoint and AoD Swap after DP.",
+            "Class-B requests are counterfactual and do not guarantee the Map's typical distribution.",
+        ],
     }
     report_path = Path(args.report) if args.report else output.with_suffix(".json")
     atomic_json_dump(report, report_path)
