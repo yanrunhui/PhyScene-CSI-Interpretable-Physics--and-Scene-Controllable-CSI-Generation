@@ -715,6 +715,7 @@ def main() -> None:
         "selection_audit": selection_report,
         "aod_condition_support": support,
         "checkpoint_paths": checkpoint_paths,
+        "system_config": active_model.synthesizer.config.as_dict(),
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

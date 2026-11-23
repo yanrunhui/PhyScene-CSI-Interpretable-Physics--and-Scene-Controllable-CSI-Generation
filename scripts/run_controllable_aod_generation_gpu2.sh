@@ -60,6 +60,7 @@ RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-artifacts/logs/controllable_aod_generation/${RUN_TAG}}"
 OUTPUT="${OUTPUT:-artifacts/generated/controllable_aod/csi_${RUN_TAG}.pt}"
 REPORT="${REPORT:-artifacts/reports/controllable_aod_generation/${RUN_TAG}/generation.json}"
+AUDIT_REPORT="${AUDIT_REPORT:-artifacts/reports/controllable_aod_generation/${RUN_TAG}/condition_compliance.json}"
 mkdir -p "${LOG_DIR}" "$(dirname -- "${OUTPUT}")" "$(dirname -- "${REPORT}")"
 QUEUE_LOG="${LOG_DIR}/queue.log"
 STATUS_FILE="${LOG_DIR}/status.txt"
@@ -71,8 +72,9 @@ on_exit() {
   else
     printf 'FAILED exit_code=%s\n' "${code}" > "${STATUS_FILE}"
   fi
-  printf 'artifact=%s\nreport=%s\nlogs=%s\nexit_code=%s\n' \
-    "${OUTPUT}" "${REPORT}" "${LOG_DIR}" "${code}" | tee -a "${QUEUE_LOG}"
+  printf 'artifact=%s\nreport=%s\naudit_report=%s\nlogs=%s\nexit_code=%s\n' \
+    "${OUTPUT}" "${REPORT}" "${AUDIT_REPORT}" "${LOG_DIR}" "${code}" \
+    | tee -a "${QUEUE_LOG}"
 }
 trap on_exit EXIT
 
@@ -86,7 +88,8 @@ trap on_exit EXIT
     "${STRONGEST_AOD_CHECKPOINT:-<not found>}"
   printf 'selected_checkpoint=%s\ndp_checkpoint=%s\nsupport_cache=%s\n' \
     "${SELECTED_CHECKPOINT}" "${DP_CHECKPOINT}" "${SUPPORT_CACHE}"
-  printf 'output=%s\nreport=%s\n' "${OUTPUT}" "${REPORT}"
+  printf 'output=%s\nreport=%s\naudit_report=%s\n' \
+    "${OUTPUT}" "${REPORT}" "${AUDIT_REPORT}"
 } | tee "${QUEUE_LOG}"
 
 COMMAND=(
@@ -116,3 +119,34 @@ else
 fi
 
 "${COMMAND[@]}" 2>&1 | tee "${LOG_DIR}/generation.log"
+
+AUDIT_COMMAND=(
+  "${PYTHON_BIN}" scripts/audit_generated_csi_conditions.py
+  --artifact "${OUTPUT}"
+  --output "${AUDIT_REPORT}"
+  --expected-map-id "${MAP_ID:-10}"
+  --expected-samples 8
+  --expected-total-power-db "${TOTAL_POWER_DB:--90}"
+  --expected-delay-spread-ns "${DELAY_SPREAD_NS:-30}"
+  --expected-los-status "${LOS_STATUS:-0}"
+  --expected-path-count "${PATH_COUNT:-5}"
+  --expected-aod-mode "${AOD_MODE}"
+  --expected-aod-deg "${TARGET_AOD_DEG}"
+  --power-tolerance-db "${POWER_TOLERANCE_DB:-0.1}"
+  --ds-absolute-tolerance-ns "${DS_ABSOLUTE_TOLERANCE_NS:-0.5}"
+  --ds-relative-tolerance "${DS_RELATIVE_TOLERANCE:-0.02}"
+  --k-tolerance-db "${K_TOLERANCE_DB:-0.2}"
+  --aod-tolerance-deg "${AOD_TOLERANCE_DEG:-10}"
+  --csi-reconstruction-tolerance "${CSI_RECONSTRUCTION_TOLERANCE:-1e-5}"
+  --fail-on-violation
+)
+if [[ "${LOS_STATUS:-0}" == "1" && "${PATH_COUNT:-5}" -ge 2 ]]; then
+  AUDIT_COMMAND+=(
+    --expected-k-factor-db "${K_FACTOR_DB:-0}"
+    --expected-k-factor-validity valid
+  )
+else
+  AUDIT_COMMAND+=(--expected-k-factor-validity invalid)
+fi
+
+"${AUDIT_COMMAND[@]}" 2>&1 | tee "${LOG_DIR}/condition_compliance.log"
